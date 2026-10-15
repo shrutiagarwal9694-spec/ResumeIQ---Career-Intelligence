@@ -1,83 +1,204 @@
-# ResumeIQ — AI-Based Resume Analyzer & ATS Checker
+# ResumeIQ
 
-ResumeIQ is a capstone-ready full-stack web application for the Web Developer domain. It analyzes a resume against a target job description and produces an ATS-oriented score, keyword coverage, section checks, actionable recommendations, and a downloadable analysis report.
+ResumeIQ is a full-stack resume analysis application built for ATS-focused job application improvement. It helps users upload a resume, compare it against a target job description, identify keyword gaps, check missing resume sections, score ATS readiness, and receive practical recommendations to improve job-fit before applying.
 
-## Stack
-- Frontend: React + Vite
-- Styling: CSS
-- Resume parsing: browser-side text extraction for PDF/DOCX/TXT
-- Backend: Node.js + Express
-- Database: SQLite
-- Auth: JWT + bcrypt
-- Charts: Recharts
-- Icons: Lucide React
+This project is designed as a capstone-ready application with a polished frontend, a working authentication flow, resume analysis engine, analysis history, and a career assistant experience.
 
-## Important scope note
-This starter is fully runnable and functional, but it does not claim to be a proprietary LLM or enterprise ATS. The analyzer uses a deterministic scoring engine so it works without paid AI API keys. It can later be upgraded with an LLM provider through the server.
+## Project overview
 
-## Features
-- Register/login
-- Resume upload: PDF, DOCX, TXT
-- Resume text extraction
-- Job description input
-- ATS score
-- Keyword match / missing keywords
-- Section completeness
-- Contact/link checks
-- Experience/skills/education/project checks
-- Formatting-risk heuristics
-- Improvement recommendations
-- Analysis history stored in SQLite
-- Dashboard with previous analyses
-- Delete history
-- Responsive professional UI
-- Download analysis as JSON
-- No external AI API key required
+ResumeIQ combines:
+- a responsive React frontend for landing, auth, dashboard, analysis, and history screens
+- a Node.js + Express API for authentication, analysis, chat, and data access
+- SQLite persistence for users and saved resume analyses
+- a deterministic resume analysis engine for ATS scoring and keyword matching
+- optional AI enhancement support through an external provider if configured
 
-## Requirements
+## Core features
+
+- User registration and login
+- JWT-based authentication
+- Resume upload support for PDF, DOCX, and TXT files
+- Resume text extraction from uploaded documents
+- Job description input for targeted analysis
+- ATS score calculation from 0 to 100
+- Keyword match and missing keyword detection
+- Skills match analysis against target job requirements
+- Resume section completeness checks
+- Formatting and weak-signal detection
+- Actionable recommendations for improvement
+- Saved analysis history per authenticated user
+- History view and deletion support
+- Downloadable JSON analysis output
+- Career assistant chat with resume-aware fallback guidance
+- Modern responsive UI for desktop, tablet, and mobile
+
+## Tech stack
+
+### Frontend
+- React
+- Vite
+- React Router
+- Recharts
+- Lucide React
+- Custom CSS styling system
+
+### Backend
+- Node.js
+- Express
+- JWT for auth
+- bcryptjs for password hashing
+- SQLite via better-sqlite3
+- CORS and dotenv support
+
+### Resume analysis
+- Browser-side extraction for PDF, DOCX, and TXT
+- Rule-based ATS scoring engine
+- Keyword normalization and matching logic
+
+## Project structure
+
+```text
+ResumeIQ_Capstone_Project/
+├── README.md
+├── package.json
+├── client/
+│   ├── package.json
+│   ├── index.html
+│   └── src/
+│       ├── main.jsx
+│       └── styles.css
+├── server/
+│   ├── package.json
+│   ├── data/
+│   │   └── resumeiq.sqlite
+│   └── src/
+│       ├── analyzer.js
+│       ├── auth.js
+│       ├── db.js
+│       └── index.js
+└── .gitignore
+```
+
+## Authentication and API behavior
+
+The backend exposes the following main endpoints:
+
+- POST `/api/auth/register`
+- POST `/api/auth/login`
+- POST `/api/analyze`
+- GET `/api/analyses`
+- GET `/api/analyses/:id`
+- DELETE `/api/analyses/:id`
+- POST `/api/chat`
+- GET `/api/health`
+
+Authentication is required for analysis and history access. The frontend stores the JWT in localStorage and reuses it for protected fetches.
+
+## Optional AI integration
+
+The chat assistant supports an optional external AI provider via environment variables if the project is configured to use one. If no provider is configured, the app uses a built-in fallback career guidance response to keep the assistant functional without requiring paid API keys.
+
+Common optional variables include:
+- `AI_PROVIDER`
+- `AI_API_KEY`
+- `AI_MODEL`
+- `CLIENT_ORIGIN`
+- `PORT`
+
+## Prerequisites
+
 - Node.js 18+
 - npm 9+
-- Windows/macOS/Linux
+- A modern browser
 
-## Run on Windows
-1. Extract the ZIP.
-2. Open the extracted folder in VS Code.
-3. Open Terminal.
-4. Run:
-   `npm install`
-5. Run:
-   `npm run install-all`
-6. Run:
-   `npm run dev`
-7. Open:
-   `http://localhost:5173`
+## Installation
 
-Backend:
-`http://localhost:5000`
+From the project root:
 
-The SQLite database is created automatically at:
-`server/data/resumeiq.sqlite`
+```bash
+npm install
+npm run install-all
+```
 
-## Demo flow
-1. Register an account.
-2. Login.
-3. Go to Analyze.
-4. Upload a resume.
-5. Paste a job description.
-6. Click Analyze Resume.
-7. Review ATS score, keywords, sections and recommendations.
-8. Dashboard keeps the analysis history.
+This installs the root tooling plus the frontend and backend dependencies.
 
-## Future production upgrades
-- Cloud object storage for resumes
-- PostgreSQL
-- Queue/background processing
-- LLM-based semantic matching
-- OCR for scanned PDFs
-- DOCX/PDF report generation
-- Stripe subscriptions
-- Admin analytics
-- Resume versioning
-- Job tracker
-- Public shareable report
-- Privacy/consent controls and automatic file deletion
+## Run the project
+
+From the project root:
+
+```bash
+npm run dev
+```
+
+This starts both services concurrently:
+- Frontend: Vite dev server
+- Backend: Express server on port 5000
+
+### Typical local URLs
+- Frontend: http://localhost:5173
+- Backend: http://localhost:5000
+
+> If port 5173 is already in use, Vite may automatically pick another local port such as 5174 or 5175.
+
+## Application flow
+
+1. Open the landing page.
+2. Sign up or log in.
+3. Navigate to the Analyze Resume page.
+4. Upload a PDF, DOCX, or TXT resume.
+5. Paste a target job description.
+6. Run the ATS analysis.
+7. Review score, keyword gaps, skills, section presence, formatting risks, and recommendations.
+8. Save and revisit previous analyses from the History page.
+
+## Database
+
+The project uses SQLite and creates the database automatically at:
+
+```text
+server/data/resumeiq.sqlite
+```
+
+The database stores:
+- users
+- analyses
+
+## Resume analysis logic
+
+The analysis engine performs rule-based ATS scoring based on:
+- keyword coverage against the job description
+- missing keywords
+- skills present in the resume vs. role requirements
+- section presence and completeness
+- formatting and weak-signal warnings
+- recommendation generation based on gaps
+
+This makes the tool work without requiring a paid AI service and keeps the project fully functional in a local environment.
+
+## Notes for capstone/demo use
+
+This project is ready for a functional demo and presentation:
+- professional landing page
+- working authentication flow
+- analysis workflow
+- dashboard and history
+- targeted ATS scoring logic
+- career assistant fallback support
+
+It is suitable for showcasing a practical full-stack resume optimization system for student or portfolio presentation.
+
+## Future improvements
+
+Possible upgrades for a production version include:
+- cloud resume storage
+- OCR support for scanned PDFs
+- richer AI-powered semantic matching
+- PDF/DOCX report export generation
+- improved analytics and dashboard filters
+- user profile management
+- role-based access and admin tooling
+- larger dataset and benchmark evaluation
+
+## License
+
+This project is intended for academic and portfolio use unless otherwise stated by the repository owner.
