@@ -1,6 +1,6 @@
-import React, {useEffect, useRef, useState} from "react";
+ï»¿import React, {useEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
-import {BrowserRouter, Routes, Route, Link, Navigate, useNavigate, useLocation} from "react-router-dom";
+import {BrowserRouter, Routes, Route, Link, Navigate, useNavigate, useLocation, useSearchParams} from "react-router-dom";
 import {FileText, LayoutDashboard, ScanSearch, History, LogOut, Upload, CheckCircle2, XCircle, Sparkles, Trash2, Download, ArrowRight, BriefcaseBusiness, Target, TrendingUp, MessageCircle, SendHorizonal, X, Eye, EyeOff, ShieldCheck} from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 import mammoth from "mammoth";
@@ -375,7 +375,7 @@ function Analyze() {
             <Upload size={22} />
             <div>
               <b>{file ? file.name : "Choose your resume"}</b>
-              <span>{file ? "Resume text extracted successfully" : "PDF • DOCX • TXT"}</span>
+              <span>{file ? "Resume text extracted successfully" : "PDF, DOCX, or TXT"}</span>
             </div>
             <input type="file" accept=".pdf,.docx,.txt" onChange={choose} />
           </label>
@@ -406,20 +406,20 @@ function Analyze() {
   );
 }
 
-function Results({ result, onDownload }) {
+function Results({ result, onDownload, heading = "Your ATS readiness report", eyebrow = "ANALYSIS COMPLETE" }) {
   const bars = [
     { name: "Keyword Match", value: result.keywordScore ?? 0 },
     { name: "Skills Match", value: result.skillScore ?? 0 },
     { name: "Sections", value: result.sectionScore ?? 0 },
-    { name: "Formatting", value: result.formattingScore ?? 0 },
+    { name: "Formatting", value: result.formattingScore ?? Math.max(0, 100 - (result.formattingRisks || []).length * 10) },
   ];
 
   return (
-    <section className="results reveal">
+    <section className="results">
       <div className="result-head">
         <div>
-          <div className="eyebrow">ANALYSIS COMPLETE</div>
-          <h2>Your ATS readiness report</h2>
+          <div className="eyebrow">{eyebrow}</div>
+          <h2>{heading}</h2>
         </div>
         <button className="secondary" onClick={onDownload} type="button"><Download size={16} /> JSON Report</button>
       </div>
@@ -474,6 +474,17 @@ function Results({ result, onDownload }) {
         </div>
       </div>
 
+      <div className="card formatting-card">
+        <h3>Formatting Risks</h3>
+        {(result.formattingRisks || []).length ? (
+          <ul className="recommend-list">
+            {result.formattingRisks.map((risk) => <li key={risk}>{risk}</li>)}
+          </ul>
+        ) : (
+          <p className="muted">No formatting risks were detected.</p>
+        )}
+      </div>
+
       <div className="grid-two">
         <div className="card skill-card">
           <h3>Detected Skills</h3>
@@ -514,23 +525,87 @@ function KeywordCard({ title, items, ok }) {
 function HistoryPage() {
   const [rows, setRows] = useState([]);
   const [selected, setSelected] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [listError, setListError] = useState("");
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
+  const [detailAttempt, setDetailAttempt] = useState(0);
+  const [actionError, setActionError] = useState("");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [sort, setSort] = useState("newest");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const selectedId = searchParams.get("id");
 
-  const load = () => api("/analyses").then(setRows).catch(() => {});
+  async function load() {
+    setLoading(true);
+    setListError("");
+    try {
+      setRows(await api("/analyses"));
+    } catch (error) {
+      setListError(error.message);
+    } finally {
+      setLoading(false);
+    }
+  }
 
   useEffect(() => { load(); }, []);
 
-  async function open(id) {
-    setSelected(await api(`/analyses/${id}`));
+  useEffect(() => {
+    if (!selectedId) {
+      setSelected(null);
+      setDetailError("");
+      setDetailLoading(false);
+      return;
+    }
+
+    let active = true;
+    setSelected(null);
+    setDetailError("");
+    setDetailLoading(true);
+    api(`/analyses/${encodeURIComponent(selectedId)}`)
+      .then((data) => { if (active) setSelected(data); })
+      .catch((error) => { if (active) setDetailError(error.message); })
+      .finally(() => { if (active) setDetailLoading(false); });
+
+    return () => { active = false; };
+  }, [selectedId, detailAttempt]);
+
+  useEffect(() => {
+    if (!selectedId) return undefined;
+
+    const bodyOverflow = document.body.style.overflow;
+    const rootOverflow = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+
+    return () => {
+      document.body.style.overflow = bodyOverflow;
+      document.documentElement.style.overflow = rootOverflow;
+    };
+  }, [selectedId]);
+
+  function open(id) {
+    setSearchParams({ id: String(id) });
+  }
+
+  function downloadSelected() {
+    const blob = new Blob([JSON.stringify(selected, null, 2)], { type: "application/json" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "resumeiq-analysis.json";
+    link.click();
   }
 
   async function del(id) {
-    if (confirm("Delete this analysis?")) {
+    if (!confirm("Delete this analysis?")) return;
+    setActionError("");
+    try {
       await api(`/analyses/${id}`, { method: "DELETE" });
-      load();
-      if (selected?.id === id) setSelected(null);
+      if (selectedId === String(id)) setSearchParams({}, { replace: true });
+      await load();
+    } catch (error) {
+      setActionError(error.message);
     }
   }
 
@@ -550,6 +625,7 @@ function HistoryPage() {
   return (
     <>
       <PageTitle eyebrow="HISTORY" title="Analysis history" desc="Review your previous resume checks and track progress." />
+      {actionError && <div className="error-box" role="alert">{actionError}</div>}
 
       <div className="card history-shell">
         <div className="history-toolbar">
@@ -568,7 +644,14 @@ function HistoryPage() {
           </select>
         </div>
 
-        {!filteredRows.length ? (
+        {loading ? (
+          <Empty text="Loading analyses..." />
+        ) : listError ? (
+          <div className="history-load-error" role="alert">
+            <span>{listError}</span>
+            <button className="secondary small" type="button" onClick={load}>Retry</button>
+          </div>
+        ) : !filteredRows.length ? (
           <Empty text="No saved analyses match your current search." />
         ) : (
           <div className="history-grid">
@@ -597,22 +680,31 @@ function HistoryPage() {
         )}
       </div>
 
-      {selected && (
-        <div className="modal-backdrop" onClick={() => setSelected(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" onClick={() => setSelected(null)} type="button" aria-label="Close report">×</button>
-            <div className="eyebrow">SAVED REPORT</div>
-            <h2>{selected.job_title}</h2>
-            <div className="big-score">{selected.result?.overallScore ?? 0}%</div>
-            <div className="modal-body">
-              <KeywordCard title="Missing Keywords" items={selected.result?.missingKeywords || []} />
-              <div className="card">
-                <h3>Recommendations</h3>
-                <ul className="recommend-list">
-                  {(selected.result?.recommendations || []).map((x) => <li key={x}>{x}</li>)}
-                </ul>
+      {selectedId && (
+        <div className="modal-backdrop" onClick={() => setSearchParams({}, { replace: true })}>
+          <div className="modal history-report-modal" role="dialog" aria-modal="true" aria-label="Saved analysis report" onClick={(e) => e.stopPropagation()}>
+            <button className="close-btn" onClick={() => setSearchParams({}, { replace: true })} type="button" aria-label="Close report"><X size={18} /></button>
+            {detailLoading ? (
+              <Empty text="Loading saved analysis..." />
+            ) : detailError ? (
+              <div className="history-detail-error" role="alert">
+                <p>{detailError}</p>
+                <button className="secondary small" type="button" onClick={() => setDetailAttempt((attempt) => attempt + 1)}>Retry</button>
               </div>
-            </div>
+            ) : selected && (
+              <>
+                <div className="history-report-meta">
+                  <div><span>Resume</span><strong>{selected.resume_name || "Resume"}</strong></div>
+                  <div><span>Analyzed</span><strong>{new Date(`${selected.created_at}Z`).toLocaleString()}</strong></div>
+                </div>
+                <Results
+                  result={selected.result || {}}
+                  onDownload={downloadSelected}
+                  heading={selected.job_title || "Saved analysis"}
+                  eyebrow="SAVED ANALYSIS"
+                />
+              </>
+            )}
           </div>
         </div>
       )}
@@ -689,7 +781,7 @@ function CareerAssistant() {
 
     try {
       const data = await api("/chat", { method: "POST", body: JSON.stringify({ message: text, context: { analysis: analysisContext || {} } }) });
-      setMessages((prev) => [...prev, { id: `${Date.now()}-assistant`, role: "assistant", text: data.reply || "I’m here to help with your resume and career plan." }]);
+      setMessages((prev) => [...prev, { id: `${Date.now()}-assistant`, role: "assistant", text: data.reply || "I'm here to help with your resume and career plan." }]);
     } catch {
       setMessages((prev) => [...prev, { id: `${Date.now()}-assistant-error`, role: "assistant", text: "Career Assistant is temporarily unavailable. Please try again." }]);
     } finally {
@@ -745,7 +837,7 @@ function LandingPage() {
   const nav = useNavigate();
 
   const features = [
-    { icon: Target, title: "ATS Score", text: "Get a clear resume readiness score from 0–100." },
+    { icon: Target, title: "ATS Score", text: "Get a clear resume readiness score from 0 to 100." },
     { icon: Sparkles, title: "Keyword Analysis", text: "Find important keywords matched and missing from your resume." },
     { icon: BriefcaseBusiness, title: "Skill Detection", text: "Identify technical skills relevant to your target job." },
     { icon: FileText, title: "Section Analysis", text: "Check whether important resume sections are present." },
@@ -823,7 +915,7 @@ function LandingPage() {
       <main className="landing-main">
         <section id="home" className="landing-hero reveal">
           <div className="hero-copy">
-            <div className="hero-badge">Smart Resume Analysis • ATS Ready</div>
+            <div className="hero-badge">Smart Resume Analysis - ATS Ready</div>
             <h1>Build a Resume That Gets Noticed.</h1>
             <p>Analyze your resume against real job descriptions, discover missing keywords, and improve your ATS readiness with ResumeIQ.</p>
             <div className="hero-actions">
@@ -941,7 +1033,7 @@ function LandingPage() {
           <div className="benefits-grid">
             {benefits.map((item) => (
               <div className="benefit-item" key={item}>
-                <span className="benefit-check">?</span>
+                <span className="benefit-check"><CheckCircle2 size={17} aria-hidden="true" /></span>
                 <span>{item}</span>
               </div>
             ))}
@@ -976,7 +1068,7 @@ function LandingPage() {
           </span>
         </div>
         <p>Build better. Apply smarter.</p>
-        <small>© 2026 ResumeIQ</small>
+        <small>(c) 2026 ResumeIQ</small>
       </footer>
     </div>
   );

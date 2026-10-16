@@ -765,6 +765,23 @@ button[disabled] {
   flex-wrap: wrap;
 }
 
+.history-load-error,
+.history-detail-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  color: var(--danger);
+}
+
+.history-detail-error {
+  padding: 32px 40px 16px 0;
+}
+
+.history-detail-error p {
+  margin: 0;
+}
+
 .small {
   padding: 10px 12px;
   border-radius: 10px;
@@ -784,6 +801,8 @@ button[disabled] {
   place-items: center;
   padding: 24px;
   z-index: 20;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .modal {
@@ -794,6 +813,40 @@ button[disabled] {
   padding: 24px;
   box-shadow: var(--shadow);
   position: relative;
+}
+
+.history-report-modal {
+  width: min(940px, 94vw);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.history-report-modal .results {
+  margin-top: 20px;
+}
+
+.history-report-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  padding-right: 40px;
+}
+
+.history-report-meta > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.history-report-meta span {
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+}
+
+.history-report-meta strong {
+  overflow-wrap: anywhere;
 }
 
 .modal .eyebrow {
@@ -1783,6 +1836,10 @@ button[disabled] {
   }
 
   .history-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .history-report-meta {
     grid-template-columns: 1fr;
   }
 
