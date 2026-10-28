@@ -1,7 +1,7 @@
 ﻿import React, {useEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {BrowserRouter, Routes, Route, Link, Navigate, useNavigate, useLocation, useSearchParams} from "react-router-dom";
-import {FileText, LayoutDashboard, ScanSearch, History, LogOut, Upload, CheckCircle2, XCircle, Sparkles, Trash2, Download, ArrowRight, BriefcaseBusiness, Target, TrendingUp, MessageCircle, SendHorizonal, X, Eye, EyeOff, ShieldCheck} from "lucide-react";
+import {FileText, LayoutDashboard, ScanSearch, History, LogOut, Upload, CheckCircle2, XCircle, Sparkles, Trash2, Download, ArrowRight, BriefcaseBusiness, Target, TrendingUp, MessageCircle, SendHorizonal, X, Eye, EyeOff, ShieldCheck, Users as UsersIcon, Activity, BarChart3, FileSearch} from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 import mammoth from "mammoth";
 import {ResponsiveContainer, RadialBarChart, RadialBar, PolarAngleAxis, BarChart, Bar, XAxis, YAxis, Tooltip} from "recharts";
@@ -10,9 +10,9 @@ import "./styles.css";
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).toString();
 
 const API = "http://localhost:5000/api";
+const ADMIN_EMAIL = "shrutiagarwal9694@gmail.com";
 
 function getToken() { return localStorage.getItem("resumeiq_token"); }
-function getUser() { try { return JSON.parse(localStorage.getItem("resumeiq_user") || "{}"); } catch { return {}; } }
 function notifyAuthChange() { window.dispatchEvent(new Event("resumeiq-auth-change")); }
 
 async function api(path, options = {}) {
@@ -25,6 +25,12 @@ async function api(path, options = {}) {
 
   const res = await fetch(API + path, { ...options, headers });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && token) {
+    localStorage.removeItem("resumeiq_token");
+    localStorage.removeItem("resumeiq_user");
+    localStorage.removeItem("resumeiq_latest_analysis");
+    notifyAuthChange();
+  }
   if (!res.ok) throw new Error(data.message || "Request failed");
   return data;
 }
@@ -51,9 +57,48 @@ async function extractFile(file) {
 }
 
 function Protected({ children }) { return getToken() ? children : <Navigate to="/login" replace />; }
-function PublicOnly({ children }) { return getToken() ? <Navigate to="/dashboard" replace /> : children; }
+function getCachedRole() {
+  try { return JSON.parse(localStorage.getItem("resumeiq_user") || "{}").role; } catch { return null; }
+}
+function PublicOnly({ children }) { return getToken() ? <Navigate to={getCachedRole() === "admin" ? "/admin/dashboard" : "/dashboard"} replace /> : children; }
+
+function AdminGate({ children }) {
+  const [state, setState] = useState("checking");
+  const [retry, setRetry] = useState(0);
+
+  useEffect(() => {
+    let active = true;
+    const handleAuthChange = () => {
+      if (!getToken() && active) setState("signed-out");
+    };
+    window.addEventListener("resumeiq-auth-change", handleAuthChange);
+    if (!getToken()) {
+      setState("signed-out");
+      return () => {
+        active = false;
+        window.removeEventListener("resumeiq-auth-change", handleAuthChange);
+      };
+    }
+    api("/auth/me")
+      .then((user) => { if (active) setState(user.role === "admin" ? "allowed" : "denied"); })
+      .catch(() => { if (active) setState(getToken() ? "error" : "signed-out"); });
+    return () => {
+      active = false;
+      window.removeEventListener("resumeiq-auth-change", handleAuthChange);
+    };
+  }, [retry]);
+
+  if (state === "signed-out") return <Navigate to="/" replace />;
+  if (state === "checking") return <div className="admin-gate-state"><span className="spinner" /> Verifying administrator access...</div>;
+  if (state === "denied") return <AdminAccessDenied />;
+  if (state === "error") {
+    return <div className="admin-gate-state" role="alert"><p>Administrator access could not be verified.</p><button className="secondary" type="button" onClick={() => setRetry((value) => value + 1)}>Retry</button></div>;
+  }
+  return children;
+}
 
 function App() {
+  const location = useLocation();
   const [isAuthenticated, setIsAuthenticated] = useState(Boolean(getToken()));
 
   useEffect(() => {
@@ -69,15 +114,23 @@ function App() {
   return (
     <>
       <Routes>
-        <Route path="/" element={isAuthenticated ? <Navigate to="/dashboard" replace /> : <LandingPage />} />
+        <Route path="/" element={getToken() ? <Navigate to={getCachedRole() === "admin" ? "/admin/dashboard" : "/dashboard"} replace /> : <LandingPage />} />
         <Route path="/login" element={<PublicOnly><Auth mode="login" /></PublicOnly>} />
         <Route path="/register" element={<PublicOnly><Auth mode="register" /></PublicOnly>} />
+        <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+        <Route path="/reset-password" element={<ResetPasswordPage />} />
+        <Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} />
+        <Route path="/admin/dashboard" element={<AdminGate><AdminShell page="overview" /></AdminGate>} />
+        <Route path="/admin/users" element={<AdminGate><AdminShell page="users" /></AdminGate>} />
+        <Route path="/admin/analyses" element={<AdminGate><AdminShell page="analyses" /></AdminGate>} />
+        <Route path="/admin/usage" element={<AdminGate><AdminShell page="usage" /></AdminGate>} />
         <Route path="/dashboard" element={<Protected><Shell /></Protected>} />
         <Route path="/analyze" element={<Protected><Shell /></Protected>} />
         <Route path="/history" element={<Protected><Shell /></Protected>} />
+        <Route path="/profile" element={<Protected><Shell /></Protected>} />
         <Route path="*" element={<Navigate to={isAuthenticated ? "/dashboard" : "/"} replace />} />
       </Routes>
-      {isAuthenticated && <CareerAssistant />}
+      {isAuthenticated && !location.pathname.startsWith("/admin") && <CareerAssistant />}
     </>
   );
 }
@@ -85,26 +138,39 @@ function App() {
 function Shell() {
   const nav = useNavigate();
   const location = useLocation();
-  const [user, setUser] = useState(getUser());
+  const [user, setUser] = useState({});
 
   useEffect(() => {
-    const syncUser = () => setUser(getUser());
+    const syncUser = () => {
+      if (!getToken()) {
+        setUser({});
+        return;
+      }
+      api("/profile").then(setUser).catch(() => setUser({}));
+    };
+    syncUser();
     window.addEventListener("resumeiq-auth-change", syncUser);
-    return () => window.removeEventListener("resumeiq-auth-change", syncUser);
+    window.addEventListener("storage", syncUser);
+    return () => {
+      window.removeEventListener("resumeiq-auth-change", syncUser);
+      window.removeEventListener("storage", syncUser);
+    };
   }, []);
 
   function logout() {
-    localStorage.clear();
+    localStorage.removeItem("resumeiq_token");
+    localStorage.removeItem("resumeiq_user");
+    localStorage.removeItem("resumeiq_latest_analysis");
     notifyAuthChange();
-    nav("/login");
+    nav("/");
   }
 
-  const Page = location.pathname === "/analyze" ? Analyze : location.pathname === "/history" ? HistoryPage : Dashboard;
+  const Page = location.pathname === "/analyze" ? Analyze : location.pathname === "/history" ? HistoryPage : location.pathname === "/profile" ? ProfilePage : Dashboard;
   const navItems = [
     { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
     { to: "/analyze", label: "Analyze Resume", icon: ScanSearch },
     { to: "/history", label: "History", icon: History },
-    { to: "/dashboard", label: "Profile", icon: BriefcaseBusiness },
+    { to: "/profile", label: "Profile", icon: BriefcaseBusiness },
   ];
 
   return (
@@ -148,7 +214,9 @@ function Shell() {
 
 function Auth({ mode }) {
   const nav = useNavigate();
+  const [searchParams] = useSearchParams();
   const [form, setForm] = useState({ name: "", email: "", password: "" });
+  const [requestedRole, setRequestedRole] = useState("user");
   const [error, setError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
 
@@ -156,11 +224,13 @@ function Auth({ mode }) {
     e.preventDefault();
     setError("");
     try {
-      const d = await api(`/auth/${mode}`, { method: "POST", body: JSON.stringify(form) });
+      const requestBody = mode === "login" ? { ...form, requestedRole } : form;
+      const d = await api(`/auth/${mode}`, { method: "POST", body: JSON.stringify(requestBody) });
+      localStorage.removeItem("resumeiq_latest_analysis");
       localStorage.setItem("resumeiq_token", d.token);
       localStorage.setItem("resumeiq_user", JSON.stringify(d.user));
       notifyAuthChange();
-      nav("/dashboard");
+      nav(d.user.role === "admin" ? "/admin/dashboard" : "/dashboard");
     } catch (e) {
       setError(e.message);
     }
@@ -205,9 +275,29 @@ function Auth({ mode }) {
             <ShieldCheck size={18} className="auth-lock" />
           </div>
 
+          {mode === "login" && searchParams.get("reset") === "success" && <div className="success-box" role="status">Your password has been reset successfully.</div>}
           {error && <div className="error-box">{error}</div>}
 
           <form className="auth-form" onSubmit={submit}>
+            {mode === "login" && (
+              <div className="field-wrap">
+                <label htmlFor="login-role">Select Role</label>
+                <select
+                  id="login-role"
+                  value={requestedRole}
+                  onChange={(event) => {
+                    const role = event.target.value;
+                    setRequestedRole(role);
+                    setForm((current) => ({ ...current, email: role === "admin" ? ADMIN_EMAIL : current.email === ADMIN_EMAIL ? "" : current.email }));
+                  }}
+                >
+                  <option value="user">User</option>
+                  <option value="admin">Admin</option>
+                </select>
+                {requestedRole === "admin" && <small className="auth-role-note">Administrator access is limited to the configured account.</small>}
+              </div>
+            )}
+
             {mode === "register" && (
               <div className="field-wrap">
                 <label htmlFor="name">Full name</label>
@@ -217,7 +307,7 @@ function Auth({ mode }) {
 
             <div className="field-wrap">
               <label htmlFor="email">Email address</label>
-              <input id="email" type="email" aria-label="Email address" placeholder="name@email.com" required value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+              <input id="email" type="email" aria-label="Email address" placeholder="name@email.com" required readOnly={mode === "login" && requestedRole === "admin"} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
             </div>
 
             <div className="field-wrap">
@@ -236,6 +326,8 @@ function Auth({ mode }) {
             </button>
           </form>
 
+          {mode === "login" && requestedRole === "user" && <Link className="forgot-password-link" to="/forgot-password" state={{ fromUserLogin: true }}>Forgot Password?</Link>}
+
           <p className="switch-text">
             {mode === "login" ? "New to ResumeIQ? " : "Already have an account? "}
             <Link to={mode === "login" ? "/register" : "/login"}>{mode === "login" ? "Create one" : "Sign in"}</Link>
@@ -246,13 +338,162 @@ function Auth({ mode }) {
   );
 }
 
+function RecoveryFrame({ eyebrow, title, description, children }) {
+  return (
+    <div className="auth-page">
+      <div className="auth-shell recovery-shell">
+        <div className="auth-brand-panel">
+          <div className="brand-wrap">
+            <div className="brand-icon">R</div>
+            <div><b>ResumeIQ</b><span>Career Intelligence</span></div>
+          </div>
+          <div className="auth-copy">
+            <div className="eyebrow dark">ACCOUNT SECURITY</div>
+            <h1>Get back to your career workspace.</h1>
+            <p>Your account recovery link is private, temporary, and can only be used once.</p>
+          </div>
+          <div className="auth-stats"><div><strong>30 min</strong><span>Reset link lifetime</span></div><div><strong>One time</strong><span>Secure link usage</span></div></div>
+        </div>
+        <div className="auth-form-panel recovery-form-panel">
+          <div className="auth-form-head"><div><div className="eyebrow dark">{eyebrow}</div><h2>{title}</h2></div><ShieldCheck size={18} className="auth-lock" /></div>
+          <p className="recovery-description">{description}</p>
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ForgotPasswordPage() {
+  const location = useLocation();
+  const [email, setEmail] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  async function submit(event) {
+    event.preventDefault();
+    setLoading(true);
+    setMessage("");
+    setError("");
+    try {
+      const result = await api("/auth/password-reset/request", { method: "POST", body: JSON.stringify({ email }) });
+      setMessage(result.message);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (location.state?.fromUserLogin !== true) return <Navigate to="/login" replace />;
+
+  return (
+    <RecoveryFrame eyebrow="PASSWORD RECOVERY" title="Forgot Password?" description="Enter your registered email address to reset your password.">
+      {message ? <div className="success-box recovery-message" role="status">{message}</div> : (
+        <form className="auth-form" onSubmit={submit}>
+          {error && <div className="error-box" role="alert">{error}</div>}
+          <div className="field-wrap">
+            <label htmlFor="recovery-email">Registered Email Address</label>
+            <input id="recovery-email" type="email" autoComplete="email" required maxLength="254" value={email} onChange={(event) => setEmail(event.target.value)} />
+          </div>
+          <button className="primary full auth-submit" type="submit" disabled={loading}>{loading ? <><span className="spinner" />Sending...</> : <>Continue<ArrowRight size={17} /></>}</button>
+        </form>
+      )}
+      <Link className="recovery-back-link" to="/login">Back to Login</Link>
+    </RecoveryFrame>
+  );
+}
+
+function ResetPasswordPage() {
+  const nav = useNavigate();
+  const [searchParams] = useSearchParams();
+  const [token] = useState(() => searchParams.get("token") || "");
+  const [password, setPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmation, setShowConfirmation] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState(false);
+
+  useEffect(() => {
+    if (token) nav("/reset-password", { replace: true });
+  }, []);
+
+  const passwordStrength = [
+    password.length >= 8,
+    /[a-z]/.test(password) && /[A-Z]/.test(password),
+    /\d/.test(password),
+    /[^A-Za-z0-9]/.test(password),
+  ].filter(Boolean).length;
+  const passwordsMatch = password === confirmation;
+
+  async function submit(event) {
+    event.preventDefault();
+    setError("");
+    if (!token) return setError("This reset link is invalid or expired. Request a new one.");
+    if (password.length < 8) return setError("Use a password with at least 8 characters.");
+    if (passwordStrength < 4) return setError("Use uppercase and lowercase letters, a number, and a symbol.");
+    if (!passwordsMatch) return setError("The passwords do not match.");
+    setLoading(true);
+    try {
+      await api("/auth/password-reset/complete", { method: "POST", body: JSON.stringify({ token, password }) });
+      localStorage.removeItem("resumeiq_token");
+      localStorage.removeItem("resumeiq_user");
+      localStorage.removeItem("resumeiq_latest_analysis");
+      notifyAuthChange();
+      setSuccess(true);
+      window.setTimeout(() => nav("/login?reset=success", { replace: true }), 1200);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <RecoveryFrame eyebrow="SECURE YOUR ACCOUNT" title="Create New Password" description="Choose a new password for your ResumeIQ account.">
+      {success ? <div className="success-box recovery-message" role="status">Your password has been reset successfully. Redirecting to login...</div> : (
+        <form className="auth-form" onSubmit={submit}>
+          {error && <div className="error-box" role="alert">{error}</div>}
+          {!token && <div className="error-box" role="alert">This reset link is missing or invalid. Request a new one.</div>}
+          <div className="field-wrap">
+            <label htmlFor="new-password">New Password</label>
+            <div className="password-wrap">
+              <input id="new-password" type={showPassword ? "text" : "password"} autoComplete="new-password" required minLength="8" maxLength="128" value={password} onChange={(event) => setPassword(event.target.value)} />
+              <button type="button" className="password-toggle" onClick={() => setShowPassword((value) => !value)} aria-label={showPassword ? "Hide new password" : "Show new password"}>{showPassword ? <EyeOff size={17} /> : <Eye size={17} />}</button>
+            </div>
+            <div className="password-strength" aria-live="polite"><span className={`strength-meter strength-${passwordStrength}`}><i /></span><small>{password.length < 8 ? "At least 8 characters" : passwordStrength === 4 ? "Strong password" : "Add mixed case, a number, and a symbol"}</small></div>
+          </div>
+          <div className="field-wrap">
+            <label htmlFor="confirm-password">Confirm New Password</label>
+            <div className="password-wrap">
+              <input id="confirm-password" type={showConfirmation ? "text" : "password"} autoComplete="new-password" required minLength="8" maxLength="128" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} />
+              <button type="button" className="password-toggle" onClick={() => setShowConfirmation((value) => !value)} aria-label={showConfirmation ? "Hide confirmation password" : "Show confirmation password"}>{showConfirmation ? <EyeOff size={17} /> : <Eye size={17} />}</button>
+            </div>
+            {confirmation && !passwordsMatch && <small className="password-match-error">Passwords do not match.</small>}
+          </div>
+          <button className="primary full auth-submit" type="submit" disabled={loading || !token}>{loading ? <><span className="spinner" />Resetting...</> : <>Reset Password<ArrowRight size={17} /></>}</button>
+        </form>
+      )}
+      {!success && <Link className="recovery-back-link" to="/login">Back to Login</Link>}
+    </RecoveryFrame>
+  );
+}
+
 function PageTitle({ eyebrow, title, desc, action }) {
   return <div className="page-title"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{desc}</p></div>{action}</div>;
 }
 
 function Dashboard() {
   const [rows, setRows] = useState([]);
-  useEffect(() => { api("/analyses").then(setRows).catch(() => {}); }, []);
+  useEffect(() => {
+    const loadRows = () => api("/analyses").then(setRows).catch(() => {});
+    loadRows();
+    window.addEventListener("resumeiq-analysis-updated", loadRows);
+    return () => window.removeEventListener("resumeiq-analysis-updated", loadRows);
+  }, []);
   const avg = rows.length ? Math.round(rows.reduce((a, b) => a + b.score, 0) / rows.length) : 0;
 
   return (
@@ -298,6 +539,71 @@ function Dashboard() {
 
 function Stat({ label, value }) { return <div className="stat"><span>{label}</span><b>{value}</b></div>; }
 function Empty({ text }) { return <div className="empty">{text}</div>; }
+
+function ProfilePage() {
+  const [profile, setProfile] = useState(null);
+  const [form, setForm] = useState({ name: "", email: "" });
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    api("/profile")
+      .then((data) => {
+        if (!active) return;
+        setProfile(data);
+        setForm({ name: data.name, email: data.email });
+      })
+      .catch((requestError) => { if (active) setError(requestError.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
+
+  async function save(event) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    setNotice("");
+    try {
+      const updated = await api("/profile", { method: "PATCH", body: JSON.stringify(form) });
+      setProfile(updated);
+      setForm({ name: updated.name, email: updated.email });
+      localStorage.setItem("resumeiq_user", JSON.stringify(updated));
+      notifyAuthChange();
+      setNotice("Profile updated.");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <PageTitle eyebrow="ACCOUNT" title="Your profile" desc="View and update your account information." />
+      {loading ? <div className="card form-card"><Empty text="Loading your profile..." /></div> : error && !profile ? (
+        <div className="error-box" role="alert">{error}</div>
+      ) : profile && (
+        <form className="card form-card profile-card" onSubmit={save}>
+          {error && <div className="error-box" role="alert">{error}</div>}
+          {notice && <div className="success-box" role="status">{notice}</div>}
+          <div className="field-group">
+            <label className="field-label" htmlFor="profile-name">Full name</label>
+            <input id="profile-name" autoComplete="name" required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
+          </div>
+          <div className="field-group">
+            <label className="field-label" htmlFor="profile-email">Email address</label>
+            <input id="profile-email" type="email" autoComplete="email" required value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} />
+          </div>
+          <div className="profile-account-id"><span>Account ID</span><strong>{profile.id}</strong></div>
+          <button className="primary" type="submit" disabled={saving}>{saving ? <><span className="spinner" />Saving...</> : "Save changes"}</button>
+        </form>
+      )}
+    </>
+  );
+}
 
 function Analyze() {
   const [file, setFile] = useState(null);
@@ -549,7 +855,11 @@ function HistoryPage() {
     }
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    window.addEventListener("resumeiq-analysis-updated", load);
+    return () => window.removeEventListener("resumeiq-analysis-updated", load);
+  }, []);
 
   useEffect(() => {
     if (!selectedId) {
@@ -652,7 +962,7 @@ function HistoryPage() {
             <button className="secondary small" type="button" onClick={load}>Retry</button>
           </div>
         ) : !filteredRows.length ? (
-          <Empty text="No saved analyses match your current search." />
+          <Empty text={rows.length ? "No saved analyses match your current search." : "No analysis history found. Analyze your first resume to get started."} />
         ) : (
           <div className="history-grid">
             {filteredRows.map((r) => (
@@ -666,8 +976,9 @@ function HistoryPage() {
                 </div>
 
                 <div className="history-meta">
-                  <div><span>Date</span><strong>{new Date(r.created_at + "Z").toLocaleDateString()}</strong></div>
+
                   <div><span>Status</span><strong>{r.score >= 75 ? "Strong" : r.score >= 55 ? "Review" : "Needs work"}</strong></div>
+                   <div><span>Date</span><strong>{new Date(r.created_at + "Z").toLocaleDateString()}</strong></div>
                 </div>
 
                 <div className="history-actions">
@@ -710,6 +1021,302 @@ function HistoryPage() {
       )}
     </>
   );
+}
+
+function AdminAccessDenied() {
+  return (
+    <main className="admin-gate-state">
+      <ShieldCheck size={32} />
+      <h1>Access denied</h1>
+      <p>This account does not have administrator permissions.</p>
+      <Link className="primary" to="/dashboard">Return to ResumeIQ</Link>
+    </main>
+  );
+}
+
+function AdminShell({ page }) {
+  const nav = useNavigate();
+  const location = useLocation();
+  const [admin, setAdmin] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    api("/auth/me").then((user) => { if (active) setAdmin(user); }).catch((requestError) => { if (active) setError(requestError.message); });
+    return () => { active = false; };
+  }, []);
+
+  function logout() {
+    localStorage.removeItem("resumeiq_token");
+    localStorage.removeItem("resumeiq_user");
+    localStorage.removeItem("resumeiq_latest_analysis");
+    notifyAuthChange();
+    nav("/");
+  }
+
+  const links = [
+    { to: "/admin/dashboard", label: "Overview", icon: LayoutDashboard },
+    { to: "/admin/users", label: "Users", icon: UsersIcon },
+    { to: "/admin/analyses", label: "Resume Analyses", icon: FileSearch },
+    { to: "/admin/usage", label: "Usage & Statistics", icon: Activity },
+  ];
+  const Page = page === "users" ? AdminUsersPage : page === "analyses" ? AdminAnalysesPage : page === "usage" ? AdminUsagePage : AdminOverviewPage;
+
+  return (
+    <div className="app-shell admin-app-shell">
+      <aside className="sidebar admin-sidebar">
+        <div className="brand">
+          <div className="brand-icon">R</div>
+          <div><b>ResumeIQ</b><span>Platform Admin</span></div>
+        </div>
+        <nav className="sidebar-nav" aria-label="Admin navigation">
+          {links.map(({ to, label, icon: Icon }) => (
+            <Link key={to} to={to} className={location.pathname === to ? "nav-item active" : "nav-item"}>
+              <Icon size={18} /><span>{label}</span>
+            </Link>
+          ))}
+        </nav>
+        <div className="side-bottom">
+          <div className="user-mini">
+            <div className="avatar">{(admin?.name || "A")[0].toUpperCase()}</div>
+            <div><b>{admin?.name || "Administrator"}</b><small>{admin?.email || error || "Verifying session..."}</small></div>
+          </div>
+          <button onClick={logout} className="sidebar-logout" type="button"><LogOut size={17} /> Logout</button>
+        </div>
+      </aside>
+      <main className="main admin-main">
+        <nav className="admin-mobile-nav" aria-label="Admin navigation">
+          {links.map(({ to, label, icon: Icon }) => <Link key={to} to={to} className={location.pathname === to ? "active" : ""}><Icon size={16} />{label}</Link>)}
+        </nav>
+        <Page />
+      </main>
+    </div>
+  );
+}
+
+function AdminOverviewPage() {
+  const [overview, setOverview] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  async function load() {
+    setLoading(true);
+    setError("");
+    try { setOverview(await api("/admin/overview")); }
+    catch (requestError) { setError(requestError.message); }
+    finally { setLoading(false); }
+  }
+
+  useEffect(() => { load(); }, []);
+  const metrics = overview?.metrics;
+  const cards = metrics ? [
+    ["Registered users", metrics.totalUsers],
+    ["Resume analyses", metrics.totalAnalyses],
+    ["Resumes uploaded", metrics.totalResumesUploaded],
+    ["Active users · 30 days", metrics.activeUsers30Days],
+    ["Analyses today", metrics.analysesToday],
+    ["Average ATS score", `${metrics.averageAtsScore}%`],
+    ["New users this month", metrics.newUsersThisMonth],
+    ["Analyses per user", metrics.averageAnalysesPerUser],
+  ] : [];
+
+  return (
+    <>
+      <PageTitle eyebrow="ADMINISTRATION" title="Platform overview" desc="Live account, analysis, and usage metrics." action={<button className="secondary" type="button" onClick={load} disabled={loading}><Activity size={16} /> Refresh</button>} />
+      {loading ? <div className="card admin-loading"><span className="spinner" /> Loading platform metrics...</div> : error ? <div className="error-box" role="alert">{error}</div> : overview && (
+        <>
+          <div className="stats admin-stats">{cards.map(([label, value]) => <Stat key={label} label={label} value={value} />)}</div>
+          <p className="admin-data-note">Resume uploads are counted from stored analysis records. Activity and daily metrics use UTC.</p>
+          <AdminAnalyticsCharts overview={overview} compact />
+        </>
+      )}
+    </>
+  );
+}
+
+function AdminBarChart({ title, data, xKey, dataKey, color = "#2563eb", emptyText = "No data available yet." }) {
+  const hasValues = data?.some((item) => Number(item[dataKey]) > 0);
+  return (
+    <section className="card admin-chart-card">
+      <div className="admin-chart-heading"><h3>{title}</h3><BarChart3 size={17} /></div>
+      {hasValues ? (
+        <ResponsiveContainer width="100%" height={260}>
+          <BarChart data={data} margin={{ top: 8, right: 8, left: -18, bottom: 2 }}>
+            <XAxis dataKey={xKey} tick={{ fontSize: 11 }} axisLine={false} tickLine={false} />
+            <YAxis allowDecimals={false} tick={{ fontSize: 11 }} axisLine={false} tickLine={false} />
+            <Tooltip />
+            <Bar dataKey={dataKey} fill={color} radius={[4, 4, 0, 0]} maxBarSize={36} />
+          </BarChart>
+        </ResponsiveContainer>
+      ) : <Empty text={emptyText} />}
+    </section>
+  );
+}
+
+function AdminAnalyticsCharts({ overview, compact = false }) {
+  const titleData = (overview.topTargetJobTitles || []).map((item) => ({ ...item, label: item.title }));
+  return (
+    <div className="admin-chart-grid">
+      <AdminBarChart title="User registrations · 12 months" data={overview.monthlyTrends} xKey="label" dataKey="registrations" color="#0e7490" emptyText="No registrations in this period." />
+      <AdminBarChart title="Resume analyses · 12 months" data={overview.monthlyTrends} xKey="label" dataKey="analyses" color="#2563eb" emptyText="No analyses in this period." />
+      <AdminBarChart title="ATS score distribution" data={overview.atsScoreDistribution} xKey="band" dataKey="count" color="#16a34a" emptyText="No valid ATS scores recorded." />
+      {!compact && <AdminBarChart title="Popular target job titles" data={titleData} xKey="label" dataKey="count" color="#ea580c" emptyText="No target job titles have been selected." />}
+    </div>
+  );
+}
+
+function AdminUsagePage() {
+  const [overview, setOverview] = useState(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api("/admin/overview").then(setOverview).catch((requestError) => setError(requestError.message)).finally(() => setLoading(false));
+  }, []);
+
+  return (
+    <>
+      <PageTitle eyebrow="USAGE" title="Usage & statistics" desc="Platform activity and ATS score trends based on stored records." />
+      {loading ? <div className="card admin-loading"><span className="spinner" /> Loading usage statistics...</div> : error ? <div className="error-box" role="alert">{error}</div> : overview && <AdminAnalyticsCharts overview={overview} />}
+    </>
+  );
+}
+
+function formatAdminDate(value) {
+  return value ? new Date(`${value.replace(" ", "T")}Z`).toLocaleString() : "Never";
+}
+
+function AdminUsersPage() {
+  const [query, setQuery] = useState("");
+  const [search, setSearch] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [activity, setActivity] = useState("");
+  const [page, setPage] = useState(1);
+  const [result, setResult] = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    const params = new URLSearchParams({ page: String(page), limit: "20" });
+    if (search) params.set("q", search);
+    if (from) params.set("from", from);
+    if (to) params.set("to", to);
+    if (activity) params.set("activity", activity);
+    setLoading(true);
+    api(`/admin/users?${params}`)
+      .then((data) => { if (active) setResult(data); })
+      .catch((requestError) => { if (active) setError(requestError.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [page, search, from, to, activity]);
+
+  async function viewUser(id) {
+    setSelected({ loading: true });
+    try { setSelected(await api(`/admin/users/${id}`)); }
+    catch (requestError) { setSelected({ error: requestError.message }); }
+  }
+
+  function applySearch(event) {
+    event.preventDefault();
+    setPage(1);
+    setSearch(query.trim());
+  }
+
+  return (
+    <>
+      <PageTitle eyebrow="ACCOUNTS" title="Users" desc="Search registered accounts and review basic account activity." />
+      <form className="card admin-filters" onSubmit={applySearch}>
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search name or email" aria-label="Search users by name or email" />
+        <label>From <input type="date" value={from} onChange={(event) => { setPage(1); setFrom(event.target.value); }} /></label>
+        <label>To <input type="date" value={to} onChange={(event) => { setPage(1); setTo(event.target.value); }} /></label>
+        <select aria-label="Filter by activity" value={activity} onChange={(event) => { setPage(1); setActivity(event.target.value); }}>
+          <option value="">All activity</option><option value="30d">Active in 30 days</option><option value="90d">Active in 90 days</option><option value="inactive">Inactive 90+ days</option>
+        </select>
+        <button className="primary" type="submit">Search</button>
+      </form>
+      {error && <div className="error-box" role="alert">{error}</div>}
+      <section className="card admin-table-card">
+        {loading ? <div className="admin-loading"><span className="spinner" /> Loading users...</div> : !result?.users.length ? <Empty text="No users match these filters." /> : (
+          <div className="admin-table-scroll">
+            <table className="admin-table">
+              <thead><tr><th>ID</th><th>User</th><th>Role</th><th>Registered</th><th>Analyses</th><th>Last active</th><th /></tr></thead>
+              <tbody>{result.users.map((user) => (
+                <tr key={user.id}>
+                  <td>{user.id}</td><td><strong>{user.name}</strong><small>{user.email}</small></td><td><span className="admin-role-pill">User</span></td>
+                  <td>{formatAdminDate(user.created_at)}</td><td>{user.analyses_count}</td><td>{formatAdminDate(user.last_active_at)}</td>
+                  <td><button className="secondary small" type="button" onClick={() => viewUser(user.id)}>Details</button></td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        )}
+        {result?.total > 0 && <AdminPagination page={result.page} pages={result.pages} total={result.total} onChange={setPage} />}
+      </section>
+      {selected && <div className="modal-backdrop" onClick={() => setSelected(null)}><section className="modal admin-user-modal" role="dialog" aria-modal="true" aria-label="User details" onClick={(event) => event.stopPropagation()}>
+        <button className="close-btn" type="button" onClick={() => setSelected(null)} aria-label="Close user details"><X size={18} /></button>
+        {selected.loading ? <div className="admin-loading"><span className="spinner" /> Loading user...</div> : selected.error ? <div className="error-box" role="alert">{selected.error}</div> : <>
+          <div className="eyebrow">USER ACCOUNT</div><h2>{selected.name}</h2><p className="muted">{selected.email}</p>
+          <dl className="admin-user-details"><div><dt>User ID</dt><dd>{selected.id}</dd></div><div><dt>Role</dt><dd>{selected.role}</dd></div><div><dt>Registered</dt><dd>{formatAdminDate(selected.created_at)}</dd></div><div><dt>Last active</dt><dd>{formatAdminDate(selected.last_active_at)}</dd></div><div><dt>Total analyses</dt><dd>{selected.analyses_count}</dd></div></dl>
+        </>}
+      </section></div>}
+    </>
+  );
+}
+
+function AdminAnalysesPage() {
+  const [query, setQuery] = useState("");
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    const params = new URLSearchParams({ page: String(page), limit: "20" });
+    if (search) params.set("q", search);
+    setLoading(true);
+    api(`/admin/analyses?${params}`)
+      .then((data) => { if (active) setResult(data); })
+      .catch((requestError) => { if (active) setError(requestError.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [page, search]);
+
+  function applySearch(event) { event.preventDefault(); setPage(1); setSearch(query.trim()); }
+
+  return (
+    <>
+      <PageTitle eyebrow="ANALYSES" title="Resume analyses" desc="Review analysis metadata and ATS scores without exposing resume contents." />
+      <form className="card admin-filters admin-analysis-search" onSubmit={applySearch}>
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search user, email, resume, or role" aria-label="Search resume analyses" />
+        <button className="primary" type="submit">Search</button>
+      </form>
+      {error && <div className="error-box" role="alert">{error}</div>}
+      <section className="card admin-table-card">
+        {loading ? <div className="admin-loading"><span className="spinner" /> Loading analyses...</div> : !result?.analyses.length ? <Empty text="No resume analyses match this search." /> : (
+          <div className="admin-table-scroll"><table className="admin-table">
+            <thead><tr><th>Analysis ID</th><th>User</th><th>Resume file</th><th>Target role</th><th>ATS score</th><th>Created</th></tr></thead>
+            <tbody>{result.analyses.map((analysis) => <tr key={analysis.id}>
+              <td>{analysis.id}</td><td><strong>{analysis.user_name}</strong><small>{analysis.user_email}</small></td><td>{analysis.resume_name}</td><td>{analysis.job_title}</td>
+              <td><span className={analysis.score >= 75 ? "admin-score high" : analysis.score >= 55 ? "admin-score medium" : "admin-score low"}>{analysis.score}%</span></td><td>{formatAdminDate(analysis.created_at)}</td>
+            </tr>)}</tbody>
+          </table></div>
+        )}
+        {result?.total > 0 && <AdminPagination page={result.page} pages={result.pages} total={result.total} onChange={setPage} />}
+      </section>
+    </>
+  );
+}
+
+function AdminPagination({ page, pages, total, onChange }) {
+  return <div className="admin-pagination"><span>{total} records · Page {page} of {Math.max(1, pages)}</span><div>
+    <button className="secondary small" type="button" disabled={page <= 1} onClick={() => onChange(page - 1)}>Previous</button>
+    <button className="secondary small" type="button" disabled={page >= pages} onClick={() => onChange(page + 1)}>Next</button>
+  </div></div>;
 }
 
 function FeatureCard({ icon: Icon, title, text }) {

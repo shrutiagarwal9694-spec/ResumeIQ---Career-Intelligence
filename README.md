@@ -85,6 +85,15 @@ The backend exposes the following main endpoints:
 
 - POST `/api/auth/register`
 - POST `/api/auth/login`
+- GET `/api/profile`
+- PATCH `/api/profile`
+- GET `/api/auth/me`
+- POST `/api/auth/password-reset/request`
+- POST `/api/auth/password-reset/complete`
+- GET `/api/admin/overview` (admin)
+- GET `/api/admin/users` (admin)
+- GET `/api/admin/users/:id` (admin)
+- GET `/api/admin/analyses` (admin)
 - POST `/api/analyze`
 - GET `/api/analyses`
 - GET `/api/analyses/:id`
@@ -93,6 +102,15 @@ The backend exposes the following main endpoints:
 - GET `/api/health`
 
 Authentication is required for analysis and history access. The frontend stores the JWT in localStorage and reuses it for protected fetches.
+Profile and analysis endpoints derive ownership from the verified JWT; a client-supplied user ID is never used as proof of access. Set `JWT_SECRET` to a long random value in deployments. Local development creates a persistent random signing secret in the ignored `server/data/.jwt-secret` file when the variable is not set.
+
+### Administrator provisioning
+
+The initial administrator is `shrutiagarwal9694@gmail.com`. Set `ADMIN_INITIAL_PASSWORD` only in `server/.env` to a password of at least 8 characters. This address already exists in the current database as a regular user, so explicitly set `ADMIN_PROMOTE_EXISTING=true` to replace its password hash and promote it during startup. Without that opt-in, an existing user is never promoted based on email alone. After successful one-time provisioning, remove both bootstrap variables from the runtime environment and restart the server. Local `.env` files are ignored by Git. Admin routes and APIs verify the role stored in SQLite on each request; role selection at login does not grant privileges.
+
+### Password recovery
+
+Password recovery is available to ordinary users only. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, and `FRONTEND_URL` in `server/.env` to enable delivery. Without a working SMTP configuration, recovery requests return HTTP 503 and no reset link is created or claimed to have been sent. Reset tokens are random, stored only as keyed hashes, expire after 30 minutes, are single-use, and are invalidated after a successful reset. Requests and verification attempts are rate-limited; successful resets increment the account auth version and revoke its existing sessions.
 
 ## Optional AI integration
 
