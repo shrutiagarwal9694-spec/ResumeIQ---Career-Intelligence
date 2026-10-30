@@ -6,6 +6,10 @@ import { randomBytes } from "node:crypto";
 import db from "./db.js";
 import { signToken, requireAuth, requireAdmin, hashForStorage } from "./auth.js";
 import { analyzeResume } from "./analyzer.js";
+import {
+  createAnalysisNotifications,
+  startWeeklyTipsScheduler,
+} from "./notifications.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -44,15 +48,32 @@ function buildFallbackReply(message, analysis = {}) {
   }
 
   if (/(ats|score)/.test(text)) {
-    const overall = Number(analysis.overallScore ?? 82);
-    const keyword = Number(analysis.keywordScore ?? 89);
-    const skill = Number(analysis.skillScore ?? 84);
-    return `Your latest ATS snapshot shows ${overall}% overall, with keyword strength at ${keyword}% and skills at ${skill}%. The strongest improvement lever is usually keyword alignment and measurable impact statements in your bullets.`;
+    const resumeOnly = analysis.analysisMode === "resume-only";
+    const legacy = !analysis.analysisMode;
+    const score = resumeOnly ? analysis.atsReadabilityScore : analysis.overallJobMatchScore ?? analysis.overallScore;
+    if (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > 100) {
+      return "I don't have a completed analysis score to report yet. Run a resume analysis first; I can offer general ATS guidance in the meantime.";
+    }
+    if (resumeOnly) return `Your latest report estimates ATS readability at ${score}%. It does not include a job-match score because no job description was supplied.`;
+    if (legacy) return `Your saved analysis score is ${score}%. This older report predates separate job-match and ATS-readability scores.`;
+    const readability = typeof analysis.atsReadabilityScore === "number" ? `${analysis.atsReadabilityScore}%` : "unavailable";
+    return `Your latest report's estimated Job Match Score is ${score}%, with a separate ATS readability estimate of ${readability}. These are estimates, not an ATS decision prediction.`;
   }
 
   if (/(keyword|keywords|skills|missing)/.test(text)) {
-    const missing = Array.isArray(analysis.missingKeywords) && analysis.missingKeywords.length ? analysis.missingKeywords.slice(0, 5).join(", ") : "role-specific tools, hard skills, and action verbs";
-    return `Add the role-specific target keywords naturally across your summary, skills, and experience. A strong list to prioritize includes ${missing}. Keep the wording accurate and tailored to the job description.`;
+    const hasAnalysis = Boolean(analysis.analysisMode) || typeof analysis.overallScore === "number";
+    const missingRequired = Array.isArray(analysis.missingRequiredSkills)
+      ? analysis.missingRequiredSkills.map((item) => item.skill)
+      : Array.isArray(analysis.missingKeywords) ? analysis.missingKeywords : [];
+    const missingPreferred = Array.isArray(analysis.missingPreferredSkills)
+      ? analysis.missingPreferredSkills.map((item) => item.skill)
+      : [];
+    if (!hasAnalysis && !missingRequired.length) {
+      return "I don't have a completed role-specific analysis to inspect. Analyze your resume with a job description first; in general, include only relevant skills you can truthfully support with experience or project evidence.";
+    }
+    const requiredText = missingRequired.length ? missingRequired.slice(0, 5).join(", ") : "none reported";
+    const preferredText = missingPreferred.length ? missingPreferred.slice(0, 5).join(", ") : "none reported";
+    return `The report identifies these missing required skills: ${requiredText}; preferred skills: ${preferredText}. Include a skill only if you can support it truthfully with relevant experience or project evidence.`;
   }
 
   if (/(section|resume sections|format)/.test(text)) {
@@ -74,7 +95,7 @@ function buildFallbackReply(message, analysis = {}) {
   return "A strong next step is to align your resume to the target role: tighten your summary, add missing keywords, and highlight measurable wins that match the job requirements.";
 }
 
-async function callProvider(message, analysis = {}) {
+async function callProvider(message) {
   const provider = (process.env.AI_PROVIDER || "").toLowerCase();
   const apiKey = process.env.AI_API_KEY;
 
@@ -92,7 +113,7 @@ async function callProvider(message, analysis = {}) {
           model: process.env.AI_MODEL || "gpt-4o-mini",
           messages: [
             { role: "system", content: "You are ResumeIQ Career Assistant. Provide concise, professional, action-oriented career and resume advice. Never pretend to be a human or expose personal data." },
-            { role: "user", content: JSON.stringify({ message, analysis }) },
+            { role: "user", content: JSON.stringify({ message }) },
           ],
           temperature: 0.4,
         }),
@@ -112,6 +133,12 @@ async function callProvider(message, analysis = {}) {
 app.get("/api/health", (_, res) => res.json({ ok: true, service: "ResumeIQ API" }));
 
 const MONTHLY_SCAN_LIMIT = 500;
+const MAX_STORED_RESUME_BYTES = 4 * 1024 * 1024;
+const STORED_RESUME_TYPES = new Map([
+  [".pdf", "application/pdf"],
+  [".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+  [".txt", "text/plain"],
+]);
 const EXPERIENCE_LEVELS = ["Student / Fresher (0 years)", "0-1 years", "1-3 years", "3-5 years", "5+ years"];
 const ATS_STANDARDS = ["US / Global ATS Standard", "Indian ATS Standard", "UK ATS Standard", "Other"];
 const TARGET_INDUSTRIES = [
@@ -138,7 +165,8 @@ function parseStringList(value) {
 function profileForUser(userId) {
   const user = db.prepare(`
     SELECT id,name,email,phone,location,experience_level,target_job_titles_json,
-      ats_standard,target_industry,technical_skills_json,job_seeking_status,created_at
+      ats_standard,target_industry,technical_skills_json,job_seeking_status,created_at,
+      ai_job_match_alerts,weekly_ats_tips,auto_tailor_bullets
     FROM users WHERE id=?
   `).get(userId);
   if (!user) return null;
@@ -147,6 +175,15 @@ function profileForUser(userId) {
     SELECT COUNT(*) AS used FROM analyses
     WHERE user_id=? AND strftime('%Y-%m',created_at)=strftime('%Y-%m','now')
   `).get(userId);
+  const storedResume = db.prepare(`
+    SELECT file_name,mime_type,file_size,updated_at FROM stored_resumes WHERE user_id=?
+  `).get(userId) || null;
+  const latestAnalysis = storedResume ? db.prepare(`
+    SELECT id,job_title,analysis_mode,job_match_score,ats_readability_score,created_at
+    FROM analyses
+    WHERE user_id=? AND resume_name=? AND created_at>=?
+    ORDER BY id DESC LIMIT 1
+  `).get(userId, storedResume.file_name, storedResume.updated_at) || null : null;
 
   return {
     id: user.id,
@@ -160,6 +197,20 @@ function profileForUser(userId) {
     targetIndustry: user.target_industry,
     technicalSkills: parseStringList(user.technical_skills_json),
     jobSeekingStatus: user.job_seeking_status,
+    alerts: {
+      aiJobMatchAlerts: Boolean(user.ai_job_match_alerts),
+      weeklyAtsTips: Boolean(user.weekly_ats_tips),
+      autoTailorBullets: Boolean(user.auto_tailor_bullets),
+    },
+    defaultResume: storedResume,
+    latestAnalysis: latestAnalysis ? {
+      id: latestAnalysis.id,
+      jobTitle: latestAnalysis.job_title,
+      analysisMode: latestAnalysis.analysis_mode,
+      jobMatchScore: latestAnalysis.job_match_score,
+      atsReadabilityScore: latestAnalysis.ats_readability_score,
+      createdAt: latestAnalysis.created_at,
+    } : null,
     createdAt: user.created_at,
     monthlyScans: { used: usage.used, limit: MONTHLY_SCAN_LIMIT },
   };
@@ -390,6 +441,11 @@ app.patch("/api/profile", requireAuth, (req, res) => {
   const atsStandard = req.body?.atsStandard === undefined ? current.ats_standard : req.body.atsStandard;
   const targetIndustry = req.body?.targetIndustry === undefined ? current.target_industry : req.body.targetIndustry;
   const jobSeekingStatus = req.body?.jobSeekingStatus === undefined ? current.job_seeking_status : req.body.jobSeekingStatus;
+  const alerts = req.body?.alerts === undefined ? {
+    aiJobMatchAlerts: Boolean(current.ai_job_match_alerts),
+    weeklyAtsTips: Boolean(current.weekly_ats_tips),
+    autoTailorBullets: Boolean(current.auto_tailor_bullets),
+  } : req.body.alerts;
   const targetJobTitles = req.body?.targetJobTitles === undefined
     ? parseStringList(current.target_job_titles_json)
     : req.body.targetJobTitles;
@@ -409,6 +465,10 @@ app.patch("/api/profile", requireAuth, (req, res) => {
   if (!ATS_STANDARDS.includes(atsStandard)) return res.status(400).json({ message: "Choose a supported ATS standard." });
   if (!TARGET_INDUSTRIES.includes(targetIndustry)) return res.status(400).json({ message: "Choose a supported target industry." });
   if (!JOB_SEEKING_STATUSES.includes(jobSeekingStatus)) return res.status(400).json({ message: "Choose a supported job-seeking status." });
+  if (!alerts || typeof alerts !== "object" || Array.isArray(alerts)
+    || ["aiJobMatchAlerts", "weeklyAtsTips", "autoTailorBullets"].some((key) => typeof alerts[key] !== "boolean")) {
+    return res.status(400).json({ message: "AI analysis preferences must be boolean values." });
+  }
 
   const normalizeList = (list, label) => {
     if (!Array.isArray(list)) throw new Error(`${label} must be a list.`);
@@ -439,7 +499,8 @@ app.patch("/api/profile", requireAuth, (req, res) => {
   try {
     const result = db.prepare(`
       UPDATE users SET name=?,email=?,phone=?,location=?,experience_level=?,target_job_titles_json=?,
-        ats_standard=?,target_industry=?,technical_skills_json=?,job_seeking_status=? WHERE id=?
+        ats_standard=?,target_industry=?,technical_skills_json=?,job_seeking_status=?,
+        ai_job_match_alerts=?,weekly_ats_tips=?,auto_tailor_bullets=? WHERE id=?
     `).run(
       name,
       email,
@@ -451,6 +512,9 @@ app.patch("/api/profile", requireAuth, (req, res) => {
       targetIndustry,
       JSON.stringify(cleanSkills),
       jobSeekingStatus,
+      Number(alerts.aiJobMatchAlerts),
+      Number(alerts.weeklyAtsTips),
+      Number(alerts.autoTailorBullets),
       req.user.id
     );
     if (!result.changes) return res.status(404).json({ message: "Profile not found." });
@@ -463,23 +527,329 @@ app.patch("/api/profile", requireAuth, (req, res) => {
   }
 });
 
-app.post("/api/analyze", requireAuth, (req, res) => {
-  const { resumeText, resumeName, jobDescription, jobTitle } = req.body;
-  if (!resumeText || !jobDescription)
-    return res.status(400).json({ message: "Resume text and job description are required." });
+const NOTIFICATION_CATEGORIES = ["job_match", "weekly_ats_tips", "bullet_point_suggestions"];
 
-  const result = analyzeResume({ resumeText, jobDescription });
-  const info = db.prepare(`
-    INSERT INTO analyses (user_id,resume_name,job_title,score,result_json)
-    VALUES (?,?,?,?,?)
-  `).run(req.user.id, resumeName || "Resume", jobTitle || "Target Role", result.overallScore, JSON.stringify(result));
+function notificationForClient(row) {
+  let actionData = null;
+  if (row.action_data_json) {
+    try {
+      actionData = JSON.parse(row.action_data_json);
+    } catch {
+      actionData = null;
+    }
+  }
+  if (actionData && typeof actionData === "object" && !Array.isArray(actionData)) {
+    actionData = { ...actionData, analysisId: row.analysis_id || null };
+  }
+  return {
+    id: row.id,
+    category: row.category,
+    title: row.title,
+    message: row.message,
+    isRead: Boolean(row.is_read),
+    analysisId: row.analysis_id,
+    actionData,
+    createdAt: row.created_at,
+  };
+}
+
+app.get("/api/notifications/unread-count", requireAuth, (req, res) => {
+  const { count } = db.prepare(`
+    SELECT COUNT(*) AS count FROM notifications WHERE user_id=? AND is_read=0
+  `).get(req.user.id);
+  res.json({ count });
+});
+
+app.get("/api/notifications", requireAuth, (req, res) => {
+  const rawPage = req.query.page === undefined ? "1" : String(req.query.page);
+  const rawLimit = req.query.limit === undefined ? "20" : String(req.query.limit);
+  if (!/^[1-9]\d*$/.test(rawPage) || !Number.isSafeInteger(Number(rawPage))) {
+    return res.status(400).json({ message: "Page must be a positive integer." });
+  }
+  if (!/^[1-9]\d*$/.test(rawLimit) || !Number.isSafeInteger(Number(rawLimit)) || Number(rawLimit) > 50) {
+    return res.status(400).json({ message: "Limit must be between 1 and 50." });
+  }
+  const page = Number(rawPage);
+  const limit = Number(rawLimit);
+  const category = req.query.category ? String(req.query.category) : "";
+  if (category && !NOTIFICATION_CATEGORIES.includes(category)) {
+    return res.status(400).json({ message: "Choose a supported notification category." });
+  }
+  const readFilter = req.query.read === undefined ? "" : String(req.query.read);
+  if (readFilter && !["true", "false"].includes(readFilter)) {
+    return res.status(400).json({ message: "Read filter must be true or false." });
+  }
+  const conditions = ["user_id=?"];
+  const values = [req.user.id];
+  if (category) {
+    conditions.push("category=?");
+    values.push(category);
+  }
+  if (readFilter) {
+    conditions.push("is_read=?");
+    values.push(readFilter === "true" ? 1 : 0);
+  }
+  const where = conditions.join(" AND ");
+  const total = db.prepare(`SELECT COUNT(*) AS count FROM notifications WHERE ${where}`).get(...values).count;
+  const unreadCount = db.prepare("SELECT COUNT(*) AS count FROM notifications WHERE user_id=? AND is_read=0").get(req.user.id).count;
+  const rows = db.prepare(`
+    SELECT id,category,title,message,is_read,analysis_id,action_data_json,created_at
+    FROM notifications WHERE ${where}
+    ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?
+  `).all(...values, limit, (page - 1) * limit);
+  res.json({ notifications: rows.map(notificationForClient), page, limit, total, unreadCount, pages: Math.ceil(total / limit) });
+});
+
+app.patch("/api/notifications/read-all", requireAuth, (req, res) => {
+  const updated = db.prepare("UPDATE notifications SET is_read=1 WHERE user_id=? AND is_read=0").run(req.user.id).changes;
+  res.json({ updated, unreadCount: 0 });
+});
+
+app.patch("/api/notifications/:id/read", requireAuth, (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ message: "Notification ID is invalid." });
+  const result = db.prepare("UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?").run(Number(req.params.id), req.user.id);
+  if (!result.changes) return res.status(404).json({ message: "Notification not found." });
+  const row = db.prepare(`
+    SELECT id,category,title,message,is_read,analysis_id,action_data_json,created_at
+    FROM notifications WHERE id=? AND user_id=?
+  `).get(Number(req.params.id), req.user.id);
+  res.json({ notification: notificationForClient(row) });
+});
+
+app.patch("/api/notifications/:id/unread", requireAuth, (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ message: "Notification ID is invalid." });
+  const result = db.prepare("UPDATE notifications SET is_read=0 WHERE id=? AND user_id=?").run(Number(req.params.id), req.user.id);
+  if (!result.changes) return res.status(404).json({ message: "Notification not found." });
+  const row = db.prepare(`
+    SELECT id,category,title,message,is_read,analysis_id,action_data_json,created_at
+    FROM notifications WHERE id=? AND user_id=?
+  `).get(Number(req.params.id), req.user.id);
+  res.json({ notification: notificationForClient(row) });
+});
+
+app.delete("/api/notifications/:id", requireAuth, (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ message: "Notification ID is invalid." });
+  const result = db.prepare("DELETE FROM notifications WHERE id=? AND user_id=?").run(Number(req.params.id), req.user.id);
+  if (!result.changes) return res.status(404).json({ message: "Notification not found." });
+  res.json({ ok: true });
+});
+
+app.put(
+  "/api/profile/resume",
+  requireAuth,
+  express.raw({ type: "application/octet-stream", limit: MAX_STORED_RESUME_BYTES }),
+  (req, res) => {
+    if (!Buffer.isBuffer(req.body) || !req.body.length) {
+      return res.status(400).json({ message: "Choose a non-empty PDF, DOCX, or TXT resume." });
+    }
+    const encodedName = req.get("x-resume-file-name") || "";
+    let fileName;
+    try {
+      fileName = decodeURIComponent(encodedName).trim();
+    } catch {
+      return res.status(400).json({ message: "Resume filename is not valid." });
+    }
+    if (!fileName || fileName.length > 255 || /[\\/\x00-\x1f]/.test(fileName)) {
+      return res.status(400).json({ message: "Resume filename is not valid." });
+    }
+    const extension = fileName.slice(fileName.lastIndexOf(".")).toLowerCase();
+    const mimeType = STORED_RESUME_TYPES.get(extension);
+    if (!mimeType) return res.status(415).json({ message: "Supported resume formats: PDF, DOCX, and TXT." });
+    if (req.body.length > MAX_STORED_RESUME_BYTES) {
+      return res.status(413).json({ message: "Resume files must be 4 MB or smaller." });
+    }
+    if (extension === ".pdf" && req.body.subarray(0, 5).toString("ascii") !== "%PDF-") {
+      return res.status(400).json({ message: "This file does not appear to be a valid PDF." });
+    }
+    if (extension === ".docx" && !(req.body[0] === 0x50 && req.body[1] === 0x4b && req.body[2] === 0x03 && req.body[3] === 0x04)) {
+      return res.status(400).json({ message: "This file does not appear to be a valid DOCX document." });
+    }
+
+    db.prepare(`
+      INSERT INTO stored_resumes (user_id,file_name,mime_type,file_size,file_data,updated_at)
+      VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+      ON CONFLICT(user_id) DO UPDATE SET
+        file_name=excluded.file_name,mime_type=excluded.mime_type,file_size=excluded.file_size,
+        file_data=excluded.file_data,updated_at=CURRENT_TIMESTAMP
+    `).run(req.user.id, fileName, mimeType, req.body.length, req.body);
+    res.json({ defaultResume: profileForUser(req.user.id).defaultResume });
+  }
+);
+
+app.get("/api/profile/resume", requireAuth, (req, res) => {
+  const resume = db.prepare(`
+    SELECT file_name,mime_type,file_data FROM stored_resumes WHERE user_id=?
+  `).get(req.user.id);
+  if (!resume) return res.status(404).json({ message: "No default resume is stored for this account." });
+  const inline = resume.mime_type === "application/pdf" || resume.mime_type === "text/plain";
+  const safeName = resume.file_name.replace(/[^A-Za-z0-9._ -]/g, "_").replace(/["\\]/g, "_");
+  res.set({
+    "Content-Type": resume.mime_type,
+    "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(resume.file_name)}`,
+    "Content-Length": String(resume.file_data.length),
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "private, no-store",
+  });
+  res.send(resume.file_data);
+});
+
+function exportAnalysisSummary(row) {
+  let result;
+  try {
+    result = JSON.parse(row.result_json);
+  } catch {
+    return { id: row.id, jobTitle: row.job_title, resumeName: row.resume_name, createdAt: row.created_at, summaryStatus: "unavailable" };
+  }
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return { id: row.id, jobTitle: row.job_title, resumeName: row.resume_name, createdAt: row.created_at, summaryStatus: "unavailable" };
+  }
+  const skillNames = (key) => Array.isArray(result[key])
+    ? result[key].filter((item) => item && typeof item.skill === "string").map((item) => item.skill)
+    : [];
+  return {
+    id: row.id,
+    jobTitle: row.job_title,
+    resumeName: row.resume_name,
+    analysisMode: row.analysis_mode,
+    overallJobMatchScore: row.job_match_score,
+    atsReadabilityScore: row.ats_readability_score,
+    createdAt: row.created_at,
+    matchedSkills: skillNames("matchedSkills"),
+    partiallyMatchedSkills: skillNames("partiallyMatchedSkills"),
+    missingRequiredSkills: skillNames("missingRequiredSkills"),
+    missingPreferredSkills: skillNames("missingPreferredSkills"),
+    scoreBreakdown: Array.isArray(result.scoreBreakdown) ? result.scoreBreakdown : [],
+    strengths: Array.isArray(result.strengths) ? result.strengths : [],
+    criticalGaps: Array.isArray(result.criticalGaps) ? result.criticalGaps : [],
+    improvementRecommendations: Array.isArray(result.improvementRecommendations) ? result.improvementRecommendations : [],
+  };
+}
+
+app.get("/api/profile/export", requireAuth, (req, res) => {
+  const profile = profileForUser(req.user.id);
+  if (!profile) return res.status(404).json({ message: "Profile not found." });
+  const rows = db.prepare(`
+    SELECT id,resume_name,job_title,analysis_mode,job_match_score,ats_readability_score,created_at,result_json
+    FROM analyses WHERE user_id=? ORDER BY id DESC
+  `).all(req.user.id);
+  const data = {
+    exportedAt: new Date().toISOString(),
+    profile,
+    analyses: rows.map(exportAnalysisSummary),
+  };
+  if (String(req.query.format || "json").toLowerCase() === "csv") {
+    const columns = [
+      ["id", "Analysis ID"],
+      ["jobTitle", "Target Job"],
+      ["resumeName", "Resume File"],
+      ["analysisMode", "Analysis Mode"],
+      ["overallJobMatchScore", "Job Match Score"],
+      ["atsReadabilityScore", "ATS Readability Score"],
+      ["createdAt", "Analyzed At"],
+      ["matchedSkills", "Matched Skills"],
+      ["missingRequiredSkills", "Missing Required Skills"],
+      ["missingPreferredSkills", "Missing Preferred Skills"],
+      ["criticalGaps", "Critical Gaps"],
+    ];
+    const csvCell = (value) => {
+      const text = Array.isArray(value) ? value.join("; ") : String(value ?? "");
+      const safe = /^[=+\-@]/.test(text) ? `'${text}` : text;
+      return `"${safe.replace(/"/g, '""')}"`;
+    };
+    const csv = [
+      columns.map(([, label]) => csvCell(label)).join(","),
+      ...data.analyses.map((analysis) => columns.map(([key]) => csvCell(analysis[key])).join(",")),
+    ].join("\r\n");
+    res.set({
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": 'attachment; filename="resumeiq-analysis-history.csv"',
+      "Cache-Control": "private, no-store",
+    });
+    return res.send(`\uFEFF${csv}`);
+  }
+  if (req.query.format && String(req.query.format).toLowerCase() !== "json") {
+    return res.status(400).json({ message: "Choose JSON or CSV export format." });
+  }
+  res.set({
+    "Content-Disposition": 'attachment; filename="resumeiq-profile-export.json"',
+    "Cache-Control": "private, no-store",
+  });
+  res.json(data);
+});
+
+app.post("/api/analyze", requireAuth, (req, res) => {
+  const { resumeText, resumeName, jobDescription = "", jobTitle } = req.body || {};
+  if (typeof resumeText !== "string" || !resumeText.trim()) {
+    return res.status(400).json({ message: "Upload a readable resume or provide its extracted text." });
+  }
+  if (typeof jobDescription !== "string") {
+    return res.status(400).json({ message: "Job description must be text." });
+  }
+  if (resumeText.length > 150000 || jobDescription.length > 50000) {
+    return res.status(413).json({ message: "The resume or job description is too large to analyze." });
+  }
+  if (resumeName !== undefined && (typeof resumeName !== "string" || resumeName.length > 255)) {
+    return res.status(400).json({ message: "Resume filename must be text no longer than 255 characters." });
+  }
+  if (jobTitle !== undefined && (typeof jobTitle !== "string" || jobTitle.length > 160)) {
+    return res.status(400).json({ message: "Target job title must be text no longer than 160 characters." });
+  }
+
+  let result;
+  try {
+    const candidateProfile = profileForUser(req.user.id);
+    const effectiveJobTitle = !jobTitle?.trim() || jobTitle.trim() === "Target Role"
+      ? candidateProfile?.targetJobTitles[0] || "Target Role"
+      : jobTitle.trim();
+    result = analyzeResume({
+      resumeText,
+      jobDescription,
+      jobTitle: effectiveJobTitle,
+      profilePreferences: candidateProfile,
+    });
+  } catch (error) {
+    if (error.status === 422) return res.status(422).json({ message: error.message });
+    throw error;
+  }
+  const savedJobTitle = jobTitle?.trim() && jobTitle.trim() !== "Target Role"
+    ? jobTitle.trim()
+    : result.analysisMode === "resume-only" ? "Resume-only analysis" : result.jobRequirements.title;
+  const saveAnalysis = db.transaction(() => {
+    const info = db.prepare(`
+      INSERT INTO analyses (
+        user_id,resume_name,job_title,score,analysis_mode,job_match_score,ats_readability_score,result_json
+      ) VALUES (?,?,?,?,?,?,?,?)
+    `).run(
+      req.user.id,
+      resumeName?.trim() || "Resume",
+      savedJobTitle,
+      result.overallScore,
+      result.analysisMode,
+      result.overallJobMatchScore,
+      result.atsReadabilityScore,
+      JSON.stringify(result),
+    );
+    const notificationPreferences = db.prepare(`
+      SELECT id,ai_job_match_alerts,auto_tailor_bullets FROM users WHERE id=?
+    `).get(req.user.id);
+    createAnalysisNotifications(db, {
+      user: notificationPreferences,
+      analysisId: Number(info.lastInsertRowid),
+      jobTitle: savedJobTitle,
+      result,
+    });
+    return info;
+  });
+  const info = saveAnalysis();
 
   res.json({ id: info.lastInsertRowid, ...result });
 });
 
 app.get("/api/analyses", requireAuth, (req, res) => {
   const rows = db.prepare(`
-    SELECT id,resume_name,job_title,score,created_at FROM analyses
+    SELECT id,resume_name,job_title,
+      COALESCE(job_match_score,ats_readability_score,score) AS score,
+      analysis_mode,job_match_score,ats_readability_score,created_at FROM analyses
     WHERE user_id=? ORDER BY id DESC
   `).all(req.user.id);
   res.json(rows);
@@ -492,8 +862,14 @@ app.get("/api/analyses/:id", requireAuth, (req, res) => {
 });
 
 app.delete("/api/analyses/:id", requireAuth, (req, res) => {
-  const result = db.prepare("DELETE FROM analyses WHERE id=? AND user_id=?").run(req.params.id, req.user.id);
-  if (!result.changes) return res.status(404).json({ message: "Analysis not found." });
+  const removeAnalysis = db.transaction(() => {
+    const analysis = db.prepare("SELECT id FROM analyses WHERE id=? AND user_id=?").get(req.params.id, req.user.id);
+    if (!analysis) return false;
+    db.prepare("UPDATE notifications SET analysis_id=NULL WHERE analysis_id=? AND user_id=?").run(analysis.id, req.user.id);
+    db.prepare("DELETE FROM analyses WHERE id=? AND user_id=?").run(analysis.id, req.user.id);
+    return true;
+  });
+  if (!removeAnalysis()) return res.status(404).json({ message: "Analysis not found." });
   res.json({ ok: true });
 });
 
@@ -508,7 +884,7 @@ app.post("/api/chat", requireAuth, async (req, res) => {
   const analysis = context.analysis && typeof context.analysis === "object" ? context.analysis : {};
 
   try {
-    const providerReply = await callProvider(message, analysis);
+    const providerReply = await callProvider(message);
     if (providerReply) {
       return res.json({ reply: providerReply });
     }
@@ -532,10 +908,10 @@ function getAdminOverview() {
     totalResumesUploaded: db.prepare("SELECT COUNT(*) AS count FROM analyses WHERE resume_name IS NOT NULL AND TRIM(resume_name)<>''").get().count,
     activeUsers30Days: db.prepare("SELECT COUNT(*) AS count FROM users WHERE role='user' AND last_active_at>=datetime('now','-30 days')").get().count,
     analysesToday: db.prepare("SELECT COUNT(*) AS count FROM analyses WHERE date(created_at)=date('now')").get().count,
-    averageAtsScore: db.prepare("SELECT ROUND(AVG(CASE WHEN score BETWEEN 0 AND 100 THEN score END),1) AS average FROM analyses").get().average,
+    averageAtsScore: db.prepare("SELECT ROUND(AVG(CASE WHEN ats_readability_score BETWEEN 0 AND 100 THEN ats_readability_score END),1) AS average FROM analyses").get().average,
+    averageJobMatchScore: db.prepare("SELECT ROUND(AVG(CASE WHEN job_match_score BETWEEN 0 AND 100 THEN job_match_score END),1) AS average FROM analyses").get().average,
     newUsersThisMonth: db.prepare("SELECT COUNT(*) AS count FROM users WHERE role='user' AND created_at>=date('now','start of month')").get().count,
   };
-  metrics.averageAtsScore ??= 0;
   metrics.averageAnalysesPerUser = metrics.totalUsers ? Number((metrics.totalAnalyses / metrics.totalUsers).toFixed(2)) : 0;
 
   const firstMonth = new Date();
@@ -568,12 +944,12 @@ function getAdminOverview() {
 
   const scoreDistribution = db.prepare(`
     SELECT CASE
-      WHEN score<40 THEN '0-39'
-      WHEN score<60 THEN '40-59'
-      WHEN score<80 THEN '60-79'
+      WHEN ats_readability_score<40 THEN '0-39'
+      WHEN ats_readability_score<60 THEN '40-59'
+      WHEN ats_readability_score<80 THEN '60-79'
       ELSE '80-100'
     END AS band,COUNT(*) AS count
-    FROM analyses WHERE score BETWEEN 0 AND 100 GROUP BY band ORDER BY MIN(score)
+    FROM analyses WHERE ats_readability_score BETWEEN 0 AND 100 GROUP BY band ORDER BY MIN(ats_readability_score)
   `).all();
   const scoreMap = new Map(scoreDistribution.map((row) => [row.band, row.count]));
   const atsScoreDistribution = ["0-39", "40-59", "60-79", "80-100"].map((band) => ({ band, count: scoreMap.get(band) || 0 }));
@@ -662,11 +1038,24 @@ app.get("/api/admin/analyses", requireAuth, requireAdmin, (req, res) => {
     SELECT COUNT(*) AS count FROM analyses a JOIN users u ON u.id=a.user_id ${where}
   `).get(...values).count;
   const rows = db.prepare(`
-    SELECT a.id,a.user_id,a.resume_name,a.job_title,a.score,a.created_at,u.name AS user_name,u.email AS user_email
+    SELECT a.id,a.user_id,a.resume_name,a.job_title,
+      COALESCE(a.job_match_score,a.ats_readability_score,a.score) AS score,
+      a.analysis_mode,a.created_at,u.name AS user_name,u.email AS user_email
     FROM analyses a JOIN users u ON u.id=a.user_id ${where}
     ORDER BY a.id DESC LIMIT ? OFFSET ?
   `).all(...values, limit, offset);
   res.json({ analyses: rows, page, limit, total, pages: Math.ceil(total / limit) });
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  if (error.type === "entity.too.large") {
+    return res.status(413).json({ message: "Resume files must be 4 MB or smaller." });
+  }
+  if (error.type === "entity.parse.failed") {
+    return res.status(400).json({ message: "Request body must contain valid JSON." });
+  }
+  return next(error);
 });
 
 try {
@@ -676,4 +1065,11 @@ try {
   process.exit(1);
 }
 
-app.listen(PORT, () => console.log(`ResumeIQ API running at http://localhost:${PORT}`));
+const stopWeeklyTipsScheduler = startWeeklyTipsScheduler(db);
+const server = app.listen(PORT, () => console.log(`ResumeIQ API running at http://localhost:${PORT}`));
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, () => {
+    stopWeeklyTipsScheduler();
+    server.close(() => process.exit(0));
+  });
+}

@@ -1,6 +1,6 @@
 # ResumeIQ
 
-ResumeIQ is a full-stack resume analysis application built for ATS-focused job application improvement. It helps users upload a resume, compare it against a target job description, identify keyword gaps, check missing resume sections, score ATS readiness, and receive practical recommendations to improve job-fit before applying.
+ResumeIQ is a full-stack resume analysis application built for ATS-focused job application improvement. It helps users compare resume evidence against a target job description, identify required and preferred skill gaps, inspect job responsibility alignment, and review estimated resume parsing readability.
 
 This project is designed as a capstone-ready application with a polished frontend, a working authentication flow, resume analysis engine, analysis history, and a career assistant experience.
 
@@ -10,25 +10,32 @@ ResumeIQ combines:
 - a responsive React frontend for landing, auth, dashboard, analysis, and history screens
 - a Node.js + Express API for authentication, analysis, chat, and data access
 - SQLite persistence for users and saved resume analyses
-- a deterministic resume analysis engine for ATS scoring and keyword matching
-- optional AI enhancement support through an external provider if configured
+- a deterministic, evidence-based resume analysis engine with weighted job matching and independent ATS readability scoring
+- optional external AI support for career-assistant chat; resume analysis does not send documents to an external model
 
 ## Core features
 
 - User registration and login
 - JWT-based authentication
+- Editable, user-scoped profile and ATS optimizer preferences
+- User-owned default resume storage (PDF, DOCX, TXT; maximum 4 MB) and resume export
+- JSON profile/history export and CSV analysis-history export
+- User-scoped in-app job-match alerts, weekly ATS tips, and fact-preserving bullet evidence suggestions
+- Paginated notifications page with unread/category filters and persistent read/delete actions
 - Resume upload support for PDF, DOCX, and TXT files
 - Resume text extraction from uploaded documents
 - Job description input for targeted analysis
-- ATS score calculation from 0 to 100
-- Keyword match and missing keyword detection
-- Skills match analysis against target job requirements
+- Job Match Score calculated from required/preferred skills, responsibility evidence, projects, explicit qualifications, demonstrated impact, and ATS readability
+- Independent estimated ATS readability score based on extracted text and recognized resume sections
+- Required and preferred skill comparisons with contextual resume evidence
+- Explicit resume-only readability mode when no job description is provided
 - Resume section completeness checks
-- Formatting and weak-signal detection
+- Text-extraction and resume-readability warnings
 - Actionable recommendations for improvement
 - Saved analysis history per authenticated user
 - History view and deletion support
 - Downloadable JSON analysis output
+- Downloadable multi-page PDF reports for saved analyses
 - Career assistant chat with resume-aware fallback guidance
 - Modern responsive UI for desktop, tablet, and mobile
 
@@ -38,6 +45,7 @@ ResumeIQ combines:
 - React
 - Vite
 - React Router
+- jsPDF and jsPDF-AutoTable for paginated saved-analysis PDF reports
 - Recharts
 - Lucide React
 - Custom CSS styling system
@@ -52,8 +60,13 @@ ResumeIQ combines:
 
 ### Resume analysis
 - Browser-side extraction for PDF, DOCX, and TXT
-- Rule-based ATS scoring engine
-- Keyword normalization and matching logic
+- Deterministic rule-based score arithmetic and keyword normalization
+- Practical skill evidence checks, required/preferred requirement handling, and source-text evidence
+- Score weights: skills 30%, experience/responsibilities 25%, projects 15%, education/certifications 10%, achievements 10%, and ATS readability 10%
+- Unavailable score dimensions are excluded and the remaining weights are proportionally renormalized
+- Resume text is extracted in the browser; OCR and external semantic resume analysis are not configured. Scanned documents may need text extraction before analysis.
+
+Run the analyzer tests with `npm --prefix server test`.
 
 ## Project structure
 
@@ -87,6 +100,15 @@ The backend exposes the following main endpoints:
 - POST `/api/auth/login`
 - GET `/api/profile`
 - PATCH `/api/profile`
+- PUT `/api/profile/resume` (authenticated, raw `application/octet-stream` body; `X-Resume-File-Name` contains the URL-encoded filename)
+- GET `/api/profile/resume` (authenticated current user's stored resume)
+- GET `/api/profile/export?format=json|csv`
+- GET `/api/notifications?page=1&limit=20&category=job_match&read=false`
+- GET `/api/notifications/unread-count`
+- PATCH `/api/notifications/:id/read`
+- PATCH `/api/notifications/:id/unread`
+- PATCH `/api/notifications/read-all`
+- DELETE `/api/notifications/:id`
 - GET `/api/auth/me`
 - POST `/api/auth/password-reset/request`
 - POST `/api/auth/password-reset/complete`
@@ -103,6 +125,8 @@ The backend exposes the following main endpoints:
 
 Authentication is required for analysis and history access. The frontend stores the JWT in localStorage and reuses it for protected fetches.
 Profile and analysis endpoints derive ownership from the verified JWT; a client-supplied user ID is never used as proof of access. Set `JWT_SECRET` to a long random value in deployments. Local development creates a persistent random signing secret in the ignored `server/data/.jwt-secret` file when the variable is not set.
+Stored resumes are kept in SQLite and scoped to the authenticated user. Replacing a stored resume does not delete prior analyses. The analysis workflow may load the saved resume, and self-reported profile skills are marked as unverified when absent from resume text rather than counted as resume evidence. Profile alert preferences control in-app notification generation. Bullet suggestions preserve existing resume text and are optional; the application does not modify resumes automatically.
+The notification scheduler runs inside the persistent API process, checks every 15 minutes, and creates the current week's tips on Monday at 09:00 or performs a catch-up after a restart later in that week. Set `APP_TIMEZONE` to an IANA timezone (for example `America/New_York`) to control Monday scheduling; the server host must keep the API process running. Weekly notifications are deduplicated per user and Monday period. Notifications are in-app only; email and browser push are not configured.
 
 ### Administrator provisioning
 
@@ -114,7 +138,7 @@ Password recovery is available to ordinary users only. Configure `SMTP_HOST`, `S
 
 ## Optional AI integration
 
-The chat assistant supports an optional external AI provider via environment variables if the project is configured to use one. If no provider is configured, the app uses a built-in fallback career guidance response to keep the assistant functional without requiring paid API keys.
+The chat assistant supports an optional external AI provider via environment variables if the project is configured to use one. Only the chat message is sent to that provider; resume-analysis results, extracted resume text, and job descriptions are not. If no provider is configured, the app uses a built-in fallback career guidance response to keep the assistant functional without requiring paid API keys.
 
 Common optional variables include:
 - `AI_PROVIDER`
@@ -165,8 +189,8 @@ This starts both services concurrently:
 3. Navigate to the Analyze Resume page.
 4. Upload a PDF, DOCX, or TXT resume.
 5. Paste a target job description.
-6. Run the ATS analysis.
-7. Review score, keyword gaps, skills, section presence, formatting risks, and recommendations.
+6. Run a job-match analysis, or leave the job description blank for resume-only readability.
+7. Review the Job Match Score, separate ATS readability estimate, skill evidence, responsibility comparisons, and recommendations.
 8. Save and revisit previous analyses from the History page.
 
 ## Database
@@ -179,19 +203,15 @@ server/data/resumeiq.sqlite
 
 The database stores:
 - users
-- analyses
+- analyses associated with the authenticated user, including separate job-match/readability scores and the saved structured report
 
 ## Resume analysis logic
 
-The analysis engine performs rule-based ATS scoring based on:
-- keyword coverage against the job description
-- missing keywords
-- skills present in the resume vs. role requirements
-- section presence and completeness
-- formatting and weak-signal warnings
-- recommendation generation based on gaps
+The analysis engine uses deterministic requirement extraction and score arithmetic. Required and preferred technical skills are counted once, and a skills-list mention is not treated as practical experience. Responsibility matching uses token overlap against extracted resume statements; education/certification checks only explicit job-description terms. The Job Match Score uses configurable weights and redistributes unavailable dimensions across the dimensions that can be assessed. The independent readability estimate is based on recognized sections, contact-detail detection, and extracted-text length.
 
-This makes the tool work without requiring a paid AI service and keeps the project fully functional in a local environment.
+The report stores the exact job-description snapshot and a SHA-256 fingerprint of the extracted resume text with its analysis result; it does not persist the full resume text. Analysis history and deletion remain scoped to the authenticated user. Previously saved reports are identified as legacy scores because their former blended score cannot be reliably separated into job-match and ATS-readability components.
+
+No OCR or external semantic analysis is configured for resumes. The current skill vocabulary and responsibility matching are deterministic and can miss uncommon terminology or paraphrases. The scores are estimates, not predictions of a specific ATS decision or hiring outcome.
 
 ## Notes for capstone/demo use
 

@@ -1,7 +1,7 @@
 ﻿import React, {useEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {BrowserRouter, Routes, Route, Link, Navigate, useNavigate, useLocation, useSearchParams} from "react-router-dom";
-import {FileText, LayoutDashboard, ScanSearch, History, LogOut, Upload, CheckCircle2, XCircle, Sparkles, Trash2, Download, ArrowRight, BriefcaseBusiness, Target, TrendingUp, MessageCircle, SendHorizonal, X, Eye, EyeOff, ShieldCheck, Users as UsersIcon, Activity, BarChart3, FileSearch} from "lucide-react";
+import {FileText, LayoutDashboard, ScanSearch, History, LogOut, Upload, CheckCircle2, XCircle, Sparkles, Trash2, Download, FileDown, ArrowRight, BriefcaseBusiness, Target, TrendingUp, MessageCircle, SendHorizonal, X, Eye, EyeOff, ShieldCheck, Users as UsersIcon, Activity, BarChart3, FileSearch, Bell, CheckCheck, Circle, ExternalLink} from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 import mammoth from "mammoth";
 import {ResponsiveContainer, RadialBarChart, RadialBar, PolarAngleAxis, BarChart, Bar, XAxis, YAxis, Tooltip} from "recharts";
@@ -14,6 +14,13 @@ const ADMIN_EMAIL = "shrutiagarwal9694@gmail.com";
 
 function getToken() { return localStorage.getItem("resumeiq_token"); }
 function notifyAuthChange() { window.dispatchEvent(new Event("resumeiq-auth-change")); }
+function clearExpiredSession(response) {
+  if (response.status !== 401 || !getToken()) return;
+  localStorage.removeItem("resumeiq_token");
+  localStorage.removeItem("resumeiq_user");
+  localStorage.removeItem("resumeiq_latest_analysis");
+  notifyAuthChange();
+}
 
 async function api(path, options = {}) {
   const token = getToken();
@@ -127,6 +134,7 @@ function App() {
         <Route path="/dashboard" element={<Protected><Shell /></Protected>} />
         <Route path="/analyze" element={<Protected><Shell /></Protected>} />
         <Route path="/history" element={<Protected><Shell /></Protected>} />
+        <Route path="/alerts" element={<Protected><Shell /></Protected>} />
         <Route path="/profile" element={<Protected><Shell /></Protected>} />
         <Route path="*" element={<Navigate to={isAuthenticated ? "/dashboard" : "/"} replace />} />
       </Routes>
@@ -139,21 +147,54 @@ function Shell() {
   const nav = useNavigate();
   const location = useLocation();
   const [user, setUser] = useState({});
+  const [unreadCount, setUnreadCount] = useState(0);
 
   useEffect(() => {
-    const syncUser = () => {
+    let active = true;
+    async function syncUser() {
       if (!getToken()) {
         setUser({});
+        setUnreadCount(0);
         return;
       }
-      api("/profile").then(setUser).catch(() => setUser({}));
+      try {
+        const [profile, unread] = await Promise.all([
+          api("/profile"),
+          api("/notifications/unread-count"),
+        ]);
+        if (active) {
+          setUser(profile);
+          setUnreadCount(unread.count);
+        }
+      } catch {
+        if (active && !getToken()) {
+          setUser({});
+          setUnreadCount(0);
+        }
+      }
+    }
+    const handleNotificationUpdate = () => {
+      if (!getToken()) {
+        setUnreadCount(0);
+        return;
+      }
+      api("/notifications/unread-count")
+        .then((result) => { if (active) setUnreadCount(result.count); })
+        .catch(() => {});
     };
     syncUser();
     window.addEventListener("resumeiq-auth-change", syncUser);
     window.addEventListener("storage", syncUser);
+    window.addEventListener("resumeiq-notifications-updated", handleNotificationUpdate);
+    window.addEventListener("resumeiq-analysis-updated", handleNotificationUpdate);
+    const poll = window.setInterval(handleNotificationUpdate, 30000);
     return () => {
+      active = false;
+      window.clearInterval(poll);
       window.removeEventListener("resumeiq-auth-change", syncUser);
       window.removeEventListener("storage", syncUser);
+      window.removeEventListener("resumeiq-notifications-updated", handleNotificationUpdate);
+      window.removeEventListener("resumeiq-analysis-updated", handleNotificationUpdate);
     };
   }, []);
 
@@ -165,11 +206,12 @@ function Shell() {
     nav("/");
   }
 
-  const Page = location.pathname === "/analyze" ? Analyze : location.pathname === "/history" ? HistoryPage : location.pathname === "/profile" ? ProfilePage : Dashboard;
+  const Page = location.pathname === "/analyze" ? Analyze : location.pathname === "/history" ? HistoryPage : location.pathname === "/alerts" ? AlertsPage : location.pathname === "/profile" ? ProfilePage : Dashboard;
   const navItems = [
     { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
     { to: "/analyze", label: "Analyze Resume", icon: ScanSearch },
     { to: "/history", label: "History", icon: History },
+    { to: "/alerts", label: "Notifications", icon: Bell },
     { to: "/profile", label: "Profile", icon: BriefcaseBusiness },
   ];
 
@@ -189,6 +231,7 @@ function Shell() {
             <Link key={label} to={to} className={location.pathname === to ? "nav-item active" : "nav-item"}>
               <Icon size={18} />
               <span>{label}</span>
+              {to === "/alerts" && unreadCount > 0 && <span className="notification-nav-count" aria-label={`${unreadCount} unread notifications`}>{unreadCount > 99 ? "99+" : unreadCount}</span>}
             </Link>
           ))}
         </nav>
@@ -494,15 +537,22 @@ function Dashboard() {
     window.addEventListener("resumeiq-analysis-updated", loadRows);
     return () => window.removeEventListener("resumeiq-analysis-updated", loadRows);
   }, []);
-  const avg = rows.length ? Math.round(rows.reduce((a, b) => a + b.score, 0) / rows.length) : 0;
+  const jobMatchRows = rows.filter((row) => row.analysis_mode === "job-match" && row.job_match_score !== null);
+  const atsRows = rows.filter((row) => row.ats_readability_score !== null);
+  const averageJobMatch = jobMatchRows.length
+    ? Math.round(jobMatchRows.reduce((sum, row) => sum + row.job_match_score, 0) / jobMatchRows.length)
+    : 0;
+  const averageAtsReadability = atsRows.length
+    ? Math.round(atsRows.reduce((sum, row) => sum + row.ats_readability_score, 0) / atsRows.length)
+    : 0;
 
   return (
     <>
       <PageTitle eyebrow="OVERVIEW" title="Your career command center" desc="Track resume performance and improve your ATS readiness." action={<Link className="primary" to="/analyze"><ScanSearch size={18} /> New Analysis</Link>} />
       <div className="stats">
         <Stat label="Analyses" value={rows.length} />
-        <Stat label="Average ATS score" value={`${avg}%`} />
-        <Stat label="Best score" value={`${rows.length ? Math.max(...rows.map((x) => x.score)) : 0}%`} />
+        <Stat label="Average Job Match" value={jobMatchRows.length ? `${averageJobMatch}%` : "—"} />
+        <Stat label="Average ATS Readability" value={atsRows.length ? `${averageAtsReadability}%` : "—"} />
         <Stat label="Status" value={rows.length ? "Active" : "Ready"} />
       </div>
 
@@ -524,7 +574,7 @@ function Dashboard() {
                     <b>{r.job_title}</b>
                     <small>{r.resume_name}</small>
                   </div>
-                  <strong className={r.score >= 75 ? "good" : r.score >= 55 ? "mid" : "low"}>{r.score}%</strong>
+                  <strong title={r.analysis_mode === "resume-only" ? "ATS readability score" : r.analysis_mode === "job-match" ? "Job match score" : "Legacy score"} aria-label={`${r.analysis_mode === "resume-only" ? "ATS readability" : r.analysis_mode === "job-match" ? "Job match" : "Legacy"} score ${r.score}%`} className={r.score >= 75 ? "good" : r.score >= 55 ? "mid" : "low"}>{r.score}%</strong>
                 </Link>
               ))}
             </div>
@@ -542,11 +592,19 @@ function Empty({ text }) { return <div className="empty">{text}</div>; }
 
 function ProfilePage() {
   const [profile, setProfile] = useState(null);
-  const [form, setForm] = useState({ name: "", email: "" });
+  const [form, setForm] = useState({
+    name: "", email: "", phone: "", location: "", experienceLevel: "Student / Fresher (0 years)",
+    targetJobTitles: [], atsStandard: "US / Global ATS Standard", targetIndustry: "Software & SaaS",
+    technicalSkills: [], alerts: { aiJobMatchAlerts: false, weeklyAtsTips: false, autoTailorBullets: false },
+  });
+  const [titleInput, setTitleInput] = useState("");
+  const [skillInput, setSkillInput] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [resumeBusy, setResumeBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const resumeInput = useRef(null);
 
   useEffect(() => {
     let active = true;
@@ -554,23 +612,76 @@ function ProfilePage() {
       .then((data) => {
         if (!active) return;
         setProfile(data);
-        setForm({ name: data.name, email: data.email });
+        setForm({
+          name: data.name || "",
+          email: data.email || "",
+          phone: data.phone || "",
+          location: data.location || "",
+          experienceLevel: data.experienceLevel || "Student / Fresher (0 years)",
+          targetJobTitles: data.targetJobTitles || [],
+          atsStandard: data.atsStandard || "US / Global ATS Standard",
+          targetIndustry: data.targetIndustry || "Software & SaaS",
+          technicalSkills: data.technicalSkills || [],
+          alerts: data.alerts || { aiJobMatchAlerts: false, weeklyAtsTips: false, autoTailorBullets: false },
+        });
       })
       .catch((requestError) => { if (active) setError(requestError.message); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, []);
 
+  function updateForm(key, value) {
+    setForm((current) => ({ ...current, [key]: value }));
+    setNotice("");
+    setError("");
+  }
+
+  function addListItem(key, input, setInput, maximumLength) {
+    const values = (key === "targetJobTitles" ? input.split(",") : [input])
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (!values.length) return;
+    if (values.some((value) => value.length > maximumLength)) {
+      setError(`Entries must be ${maximumLength} characters or fewer.`);
+      return;
+    }
+    const maximumCount = key === "targetJobTitles" ? 10 : 50;
+    const next = [...form[key]];
+    for (const value of values) {
+      if (!next.some((item) => item.toLowerCase() === value.toLowerCase())) next.push(value);
+    }
+    if (next.length > maximumCount) {
+      setError(`Add up to ${maximumCount} ${key === "targetJobTitles" ? "target job titles" : "skills"}.`);
+      return;
+    }
+    updateForm(key, next);
+    setInput("");
+    setError("");
+    setError("");
+  }
+
   async function save(event) {
     event.preventDefault();
+    if (saving) return;
     setSaving(true);
     setError("");
     setNotice("");
     try {
       const updated = await api("/profile", { method: "PATCH", body: JSON.stringify(form) });
       setProfile(updated);
-      setForm({ name: updated.name, email: updated.email });
-      localStorage.setItem("resumeiq_user", JSON.stringify(updated));
+      setForm({
+        ...form,
+        name: updated.name,
+        email: updated.email,
+        phone: updated.phone || "",
+        location: updated.location || "",
+        targetJobTitles: updated.targetJobTitles || [],
+        technicalSkills: updated.technicalSkills || [],
+        alerts: updated.alerts,
+      });
+      let cachedUser = {};
+      try { cachedUser = JSON.parse(localStorage.getItem("resumeiq_user") || "{}"); } catch { /* Rebuild the cache below. */ }
+      localStorage.setItem("resumeiq_user", JSON.stringify({ ...cachedUser, name: updated.name, email: updated.email }));
       notifyAuthChange();
       setNotice("Profile updated.");
     } catch (requestError) {
@@ -580,33 +691,283 @@ function ProfilePage() {
     }
   }
 
+  async function uploadResume(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    const extension = file.name.split(".").pop().toLowerCase();
+    if (!["pdf", "docx", "txt"].includes(extension)) {
+      setError("Supported resume formats: PDF, DOCX, and TXT.");
+      return;
+    }
+    if (!file.size || file.size > 4 * 1024 * 1024) {
+      setError("Resume files must be larger than 0 bytes and 4 MB or smaller.");
+      return;
+    }
+    setResumeBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const response = await fetch(`${API}/profile/resume`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "X-Resume-File-Name": encodeURIComponent(file.name),
+          ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}),
+        },
+        body: file,
+      });
+      clearExpiredSession(response);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.message || "Resume upload failed.");
+      const updated = await api("/profile");
+      setProfile(updated);
+      setNotice("Default resume updated. Existing analysis history was not changed.");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setResumeBusy(false);
+    }
+  }
+
+  async function viewResume() {
+    const preview = window.open("about:blank", "_blank");
+    if (!preview) {
+      setError("Allow pop-ups to preview your stored resume.");
+      return;
+    }
+    preview.document.title = "ResumeIQ resume preview";
+    preview.document.body.textContent = "Loading your resume...";
+    setError("");
+    try {
+      const response = await fetch(`${API}/profile/resume`, {
+        headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
+      });
+      clearExpiredSession(response);
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.message || "Could not open the stored resume.");
+      }
+      const blob = await response.blob();
+      const name = profile.defaultResume.file_name;
+      if (name.toLowerCase().endsWith(".docx")) {
+        const extracted = await extractFile(new File([blob], name, { type: blob.type }));
+        preview.document.body.replaceChildren();
+        const text = preview.document.createElement("pre");
+        text.textContent = extracted || "No readable text was found in this document.";
+        text.style.cssText = "white-space:pre-wrap;overflow-wrap:anywhere;padding:24px;font:14px/1.6 system-ui";
+        preview.document.body.append(text);
+      } else {
+        preview.location.href = URL.createObjectURL(blob);
+      }
+    } catch (requestError) {
+      preview.close();
+      setError(requestError.message);
+    }
+  }
+
+  async function exportData(format) {
+    setError("");
+    setNotice("");
+    try {
+      const response = await fetch(`${API}/profile/export?format=${format}`, {
+        headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
+      });
+      clearExpiredSession(response);
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.message || "Could not export profile data.");
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = format === "csv" ? "resumeiq-analysis-history.csv" : "resumeiq-profile-export.json";
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setNotice(`${format.toUpperCase()} export downloaded.`);
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  const initial = profile?.name?.trim()?.[0]?.toUpperCase() || "?";
+  const scanUsed = profile?.monthlyScans?.used || 0;
+  const scanLimit = profile?.monthlyScans?.limit || 0;
+  const scanPercent = scanLimit ? Math.min(100, Math.round(scanUsed / scanLimit * 100)) : 0;
+  const fileLabel = profile?.defaultResume?.file_name;
+  const fileExtension = fileLabel?.split(".").pop()?.toUpperCase();
+  const lastAtsScore = profile?.latestAnalysis?.atsReadabilityScore;
+
   return (
     <>
-      <PageTitle eyebrow="ACCOUNT" title="Your profile" desc="View and update your account information." />
+      <PageTitle eyebrow="ACCOUNT" title="Your profile" desc="View and update your career intelligence preferences." />
       {loading ? <div className="card form-card"><Empty text="Loading your profile..." /></div> : error && !profile ? (
         <div className="error-box" role="alert">{error}</div>
-      ) : profile && (
-        <form className="card form-card profile-card" onSubmit={save}>
+      ) : profile && <form className="profile-page-form" onSubmit={save}>
           {error && <div className="error-box" role="alert">{error}</div>}
           {notice && <div className="success-box" role="status">{notice}</div>}
-          <div className="field-group">
-            <label className="field-label" htmlFor="profile-name">Full name</label>
-            <input id="profile-name" autoComplete="name" required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
+          <div className="card profile-summary">
+            <div className="profile-summary-user">
+              <div className="profile-avatar" aria-hidden="true">{initial}</div>
+              <div className="profile-identity">
+                <h2>{profile.name}</h2>
+                <p>{profile.email}</p>
+                <div className="profile-badges">
+                  {profile.targetJobTitles.length
+                    ? profile.targetJobTitles.slice(0, 3).map((title) => <span className="profile-role-badge" key={title}>{title}</span>)
+                    : <span className="profile-role-empty">Add your target roles below</span>}
+                  <span className="profile-status-badge">Job Seeker ({profile.jobSeekingStatus})</span>
+                </div>
+              </div>
+            </div>
+            <div className="profile-summary-meta">
+              <div className="profile-account-id"><span>Account ID</span><strong>{profile.id}</strong></div>
+              <div className="scan-usage">
+                <div className="scan-usage-heading"><span>Monthly Resume Scans</span><strong>{scanUsed} / {scanLimit} ({scanPercent}%)</strong></div>
+                <div className="scan-progress" role="progressbar" aria-label="Monthly resume scans used" aria-valuemin="0" aria-valuemax={scanLimit} aria-valuenow={scanUsed}><span style={{ width: `${scanPercent}%` }} /></div>
+              </div>
+            </div>
           </div>
-          <div className="field-group">
-            <label className="field-label" htmlFor="profile-email">Email address</label>
-            <input id="profile-email" type="email" autoComplete="email" required value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} />
+          <div className="profile-section-grid">
+            <div className="profile-section-column">
+            <section className="card profile-section profile-personal-section">
+              <div className="profile-section-heading"><div><div className="eyebrow">ACCOUNT DETAILS</div><h3>PERSONAL INFORMATION</h3></div></div>
+              <div className="profile-fields-grid">
+                <div className="field-group">
+                  <label className="field-label" htmlFor="profile-name">Full Name</label>
+                  <input id="profile-name" autoComplete="name" required maxLength={120} value={form.name} onChange={(event) => updateForm("name", event.target.value)} />
+                </div>
+                <div className="field-group">
+                  <label className="field-label" htmlFor="profile-email">Email Address</label>
+                  <input id="profile-email" type="email" autoComplete="email" required maxLength={254} value={form.email} onChange={(event) => updateForm("email", event.target.value)} />
+                </div>
+                <div className="field-group">
+                  <label className="field-label" htmlFor="profile-phone">Phone Number</label>
+                  <input id="profile-phone" type="tel" autoComplete="tel" inputMode="tel" maxLength={20} value={form.phone} onChange={(event) => updateForm("phone", event.target.value)} />
+                </div>
+                <div className="field-group">
+                  <label className="field-label" htmlFor="profile-location">Current Location</label>
+                  <input id="profile-location" autoComplete="address-level2" maxLength={120} value={form.location} onChange={(event) => updateForm("location", event.target.value)} />
+                </div>
+              </div>
+            </section>
+
+            <section className="card profile-section profile-resume-section">
+              <div className="profile-section-heading"><div><div className="eyebrow">RESUME STORAGE</div><h3>DEFAULT STORED RESUME</h3></div></div>
+              {fileLabel ? (
+                <div className="stored-resume">
+                  <div className="stored-resume-file"><FileText size={22} /><div><strong>{fileLabel}</strong><span>{fileExtension} · {(profile.defaultResume.file_size / 1024 / 1024).toFixed(2)} MB</span></div></div>
+                  <div className="stored-resume-meta">
+                    {typeof lastAtsScore === "number" && <span>Last ATS score: <strong>{lastAtsScore}%</strong></span>}
+                    <span>Last analysis: <strong>{profile.latestAnalysis?.createdAt ? new Date(profile.latestAnalysis.createdAt).toLocaleDateString() : "Not analyzed yet"}</strong></span>
+                  </div>
+                  <div className="stored-resume-actions">
+                    <button className="secondary" type="button" onClick={viewResume}><Eye size={16} /> View</button>
+                    <button className="ghost" type="button" disabled={resumeBusy} onClick={() => resumeInput.current?.click()}>{resumeBusy ? <><span className="spinner" />Uploading...</> : <><Upload size={16} /> Change File</>}</button>
+                  </div>
+                </div>
+              ) : (
+                <div className="stored-resume-empty"><p>No default resume is stored yet.</p><button className="secondary" type="button" disabled={resumeBusy} onClick={() => resumeInput.current?.click()}>{resumeBusy ? "Uploading..." : "Upload a Resume"}</button></div>
+              )}
+              <input ref={resumeInput} className="visually-hidden" type="file" accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain" onChange={uploadResume} />
+              <p className="profile-help-text">PDF, DOCX, or TXT · maximum 4 MB. Replacing this file keeps your analysis history.</p>
+            </section>
+
+            <section className="card profile-section profile-account-section">
+              <div className="profile-section-heading"><div><div className="eyebrow">ACCOUNT</div><h3>ACCOUNT INFORMATION</h3></div></div>
+              <div className="profile-account-id"><span>Account ID</span><strong>{profile.id}</strong></div>
+              <div className="profile-account-id"><span>Member Since</span><strong>{profile.createdAt ? new Date(profile.createdAt).toLocaleDateString() : "—"}</strong></div>
+              <div className="profile-export">
+                <strong>Export My Resume Data &amp; History</strong>
+                <p>Download your profile, preferences, resume metadata, and analysis history.</p>
+                <div className="profile-export-actions">
+                  <button className="secondary" type="button" onClick={() => exportData("json")}><Download size={16} /> Export JSON</button>
+                  <button className="ghost" type="button" onClick={() => exportData("csv")}><Download size={16} /> Export CSV</button>
+                </div>
+              </div>
+              <div className="profile-save-row">
+                <button className="primary" type="submit" disabled={saving}>{saving ? <><span className="spinner" />Saving...</> : "Save Changes"}</button>
+              </div>
+            </section>
+            </div>
+            <div className="profile-section-column">
+            <section className="card profile-section profile-optimizer-section">
+              <div className="profile-section-heading preferences-heading">
+                <div><div className="eyebrow">CAREER TARGETING</div><h3>AI OPTIMIZER PREFERENCES</h3></div>
+                <span className="optimizer-badge">Used for ATS Scoring</span>
+              </div>
+              <div className="profile-fields-grid">
+                <div className="field-group">
+                  <label className="field-label" htmlFor="profile-experience">Current Experience Level</label>
+                  <select id="profile-experience" value={form.experienceLevel} onChange={(event) => updateForm("experienceLevel", event.target.value)}>
+                    {["Student / Fresher (0 years)", "0-1 years", "1-3 years", "3-5 years", "5+ years"].map((item) => <option key={item}>{item}</option>)}
+                  </select>
+                </div>
+                <div className="field-group">
+                  <label className="field-label" htmlFor="profile-ats">ATS Standard &amp; Format</label>
+                  <select id="profile-ats" value={form.atsStandard} onChange={(event) => updateForm("atsStandard", event.target.value)}>
+                    {["US / Global ATS Standard", "Indian ATS Standard", "UK ATS Standard", "Other"].map((item) => <option key={item}>{item}</option>)}
+                  </select>
+                </div>
+                <div className="field-group profile-skills-field">
+                  <label className="field-label" htmlFor="profile-target-title">Primary Target Job Titles</label>
+                  <div className="skill-add-row">
+                    <input id="profile-target-title" value={titleInput} maxLength={500} placeholder="e.g. Frontend Developer, AI Engineer" onChange={(event) => setTitleInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addListItem("targetJobTitles", titleInput, setTitleInput, 100); } }} />
+                    <button className="secondary" type="button" onClick={() => addListItem("targetJobTitles", titleInput, setTitleInput, 100)}>Add Title</button>
+                  </div>
+                  <div className="skill-tag-list" aria-label="Target job titles">
+                    {form.targetJobTitles.map((title) => <span className="profile-skill-tag" key={title}>{title}<button type="button" aria-label={`Remove ${title}`} onClick={() => updateForm("targetJobTitles", form.targetJobTitles.filter((item) => item !== title))}><X size={13} /></button></span>)}
+                  </div>
+                </div>
+                <div className="field-group profile-skills-field">
+                  <label className="field-label" htmlFor="profile-industry">Target Industry</label>
+                  <select id="profile-industry" value={form.targetIndustry} onChange={(event) => updateForm("targetIndustry", event.target.value)}>
+                    {["Software & SaaS", "Artificial Intelligence / Machine Learning", "IT Services", "Finance & Banking", "Healthcare", "Education", "E-commerce", "Other"].map((item) => <option key={item}>{item}</option>)}
+                  </select>
+                </div>
+                <div className="field-group profile-skills-field">
+                  <label className="field-label" htmlFor="profile-skill-input">Core Technical Skills</label>
+                  <div className="skill-add-row">
+                    <input id="profile-skill-input" value={skillInput} maxLength={80} placeholder="Add a skill, e.g. React" onChange={(event) => setSkillInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addListItem("technicalSkills", skillInput, setSkillInput, 80); } }} />
+                    <button className="secondary" type="button" onClick={() => addListItem("technicalSkills", skillInput, setSkillInput, 80)}>Add Skill</button>
+                  </div>
+                  <div className="skill-tag-list" aria-label="Core technical skills">
+                    {form.technicalSkills.map((skill) => <span className="profile-skill-tag" key={skill}>{skill}<button type="button" aria-label={`Remove ${skill}`} onClick={() => updateForm("technicalSkills", form.technicalSkills.filter((item) => item !== skill))}><X size={13} /></button></span>)}
+                  </div>
+                </div>
+              </div>
+              <p className="profile-help-text">Profile skills are treated as self-reported context; they do not count as resume evidence unless they appear in the resume.</p>
+            </section>
+            <section className="card profile-section profile-alerts-section">
+              <div className="profile-section-heading"><div><div className="eyebrow">PREFERENCES</div><h3>AI ANALYSIS &amp; ALERTS</h3></div></div>
+              <div className="profile-alert-list">
+                {[
+                  ["aiJobMatchAlerts", "AI Job Match Alerts", "Receive notification suggestions tailored to your resume."],
+                  ["weeklyAtsTips", "Weekly ATS Improvement Tips", "Highlight impactful keyword suggestions every Monday."],
+                  ["autoTailorBullets", "Auto-tailor Bullet Points", "Highlight quantifiable metrics with AI assistance."],
+                ].map(([key, label, description]) => (
+                  <label className="profile-alert-option" key={key}>
+                    <input type="checkbox" checked={form.alerts[key]} onChange={(event) => updateForm("alerts", { ...form.alerts, [key]: event.target.checked })} />
+                    <span><strong>{label}</strong><small>{description}</small></span>
+                  </label>
+                ))}
+              </div>
+              <p className="profile-help-text">In-app alerts and weekly tips appear in Notifications. Bullet suggestions preserve existing resume text; no email, push, or automatic resume edits are performed.</p>
+            </section>
+            </div>
           </div>
-          <div className="profile-account-id"><span>Account ID</span><strong>{profile.id}</strong></div>
-          <button className="primary" type="submit" disabled={saving}>{saving ? <><span className="spinner" />Saving...</> : "Save changes"}</button>
-        </form>
-      )}
+        </form>}
     </>
   );
 }
 
 function Analyze() {
   const [file, setFile] = useState(null);
+  const [storedResume, setStoredResume] = useState(null);
+  const [loadingStoredResume, setLoadingStoredResume] = useState(false);
   const [text, setText] = useState("");
   const [jd, setJd] = useState("");
   const [title, setTitle] = useState("");
@@ -615,22 +976,66 @@ function Analyze() {
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
 
+  useEffect(() => {
+    let active = true;
+    api("/profile").then((profile) => {
+      if (!active) return;
+      setStoredResume(profile.defaultResume);
+      if (profile.targetJobTitles?.[0]) setTitle((current) => current || profile.targetJobTitles[0]);
+    }).catch((requestError) => {
+      if (active) setError(requestError.message);
+    });
+    return () => { active = false; };
+  }, []);
+
+  async function loadStoredResume() {
+    setLoadingStoredResume(true);
+    setError("");
+    try {
+      const response = await fetch(`${API}/profile/resume`, {
+        headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
+      });
+      clearExpiredSession(response);
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.message || "Could not load your stored resume.");
+      }
+      const blob = await response.blob();
+      const storedFile = new File([blob], storedResume.file_name, { type: blob.type });
+      const extracted = await extractFile(storedFile);
+      setFile(storedFile);
+      setText(extracted);
+      setResult(null);
+      if (!extracted.trim()) setError("No readable text was extracted. This file may be scanned or image-only.");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setLoadingStoredResume(false);
+    }
+  }
+
   async function choose(e) {
     const f = e.target.files?.[0];
     if (!f) return;
     setError("");
+    setResult(null);
     try {
       setFile(f);
-      setText(await extractFile(f));
+      const extracted = await extractFile(f);
+      setText(extracted);
+      if (!extracted.trim()) setError("No readable text was extracted. This file may be scanned or image-only.");
     } catch (e) {
+      setText("");
       setError(e.message);
     }
   }
 
   async function run() {
-    if (!text || !jd) return setError("Upload a readable resume and paste a job description.");
+    if (!text.trim()) return setError("Upload a readable resume or provide its extracted text.");
+    if (text.trim().length < 80) return setError("The extracted resume text is too short for reliable analysis. Check the file or its text extraction.");
     setLoading(true);
     setError("");
+    setResult(null);
     try {
       const data = await api("/analyze", {
         method: "POST",
@@ -673,8 +1078,16 @@ function Analyze() {
               setDragging(false);
               const droppedFile = e.dataTransfer.files?.[0];
               if (droppedFile) {
+                setError("");
+                setResult(null);
                 setFile(droppedFile);
-                extractFile(droppedFile).then(setText).catch((err) => setError(err.message));
+                extractFile(droppedFile).then((extracted) => {
+                  setText(extracted);
+                  if (!extracted.trim()) setError("No readable text was extracted. This file may be scanned or image-only.");
+                }).catch((err) => {
+                  setText("");
+                  setError(err.message);
+                });
               }
             }}
           >
@@ -685,22 +1098,23 @@ function Analyze() {
             </div>
             <input type="file" accept=".pdf,.docx,.txt" onChange={choose} />
           </label>
+          {storedResume && <button className="ghost stored-resume-load" type="button" disabled={loadingStoredResume} onClick={loadStoredResume}>{loadingStoredResume ? <><span className="spinner" />Loading...</> : `Use saved resume: ${storedResume.file_name}`}</button>}
 
           <div className="field-group">
             <label className="field-label">Target job title</label>
-            <input placeholder="e.g. Frontend Developer" value={title} onChange={(e) => setTitle(e.target.value)} />
+            <input placeholder="e.g. Frontend Developer" value={title} onChange={(e) => { setTitle(e.target.value); setResult(null); }} />
           </div>
 
           <div className="field-group">
             <label className="field-label">Resume text preview</label>
-            <textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="Extracted resume text appears here..." />
+            <textarea value={text} onChange={(e) => { setText(e.target.value); setResult(null); }} placeholder="Extracted resume text appears here..." />
           </div>
         </div>
 
         <div className="card form-card">
           <h3>2. Paste job description</h3>
-          <p className="muted">Use the exact description from the job posting.</p>
-          <textarea className="jd" value={jd} onChange={(e) => setJd(e.target.value)} placeholder="Paste responsibilities, requirements, skills and qualifications..." />
+          <p className="muted">Use the exact description from the job posting. Leave blank for resume-only readability analysis.</p>
+          <textarea className="jd" value={jd} onChange={(e) => { setJd(e.target.value); setResult(null); }} placeholder="Paste responsibilities, requirements, skills and qualifications..." />
           <button className="primary full" onClick={run} disabled={loading} type="button">
             {loading ? <><span className="spinner" />Analyzing your resume...</> : <>Analyze Resume<ScanSearch size={18} /></>}
           </button>
@@ -712,13 +1126,35 @@ function Analyze() {
   );
 }
 
-function Results({ result, onDownload, heading = "Your ATS readiness report", eyebrow = "ANALYSIS COMPLETE" }) {
-  const bars = [
-    { name: "Keyword Match", value: result.keywordScore ?? 0 },
-    { name: "Skills Match", value: result.skillScore ?? 0 },
-    { name: "Sections", value: result.sectionScore ?? 0 },
-    { name: "Formatting", value: result.formattingScore ?? Math.max(0, 100 - (result.formattingRisks || []).length * 10) },
-  ];
+function Results({
+  result,
+  onDownload,
+  heading = "Your resume analysis report",
+  eyebrow = "ANALYSIS COMPLETE",
+  downloadLabel = "JSON Report",
+  downloadLoading = false,
+}) {
+  const score = result.overallJobMatchScore ?? result.atsReadabilityScore ?? result.overallScore ?? 0;
+  const scoreLabel = result.analysisMode === "resume-only"
+    ? "ATS Readability"
+    : result.analysisMode === "job-match"
+      ? "Job Match Score"
+      : "Legacy Score";
+  const bars = result.scoreBreakdown?.length
+    ? result.scoreBreakdown.map((item) => ({
+      name: item.dimension,
+      value: item.score,
+      status: item.status,
+      effectiveWeight: item.effectiveWeight,
+      weightedContribution: item.weightedContribution,
+      reason: item.reason,
+    }))
+    : [
+      { name: "Keyword Match", value: result.keywordScore ?? 0 },
+      { name: "Skills Match", value: result.skillScore ?? 0 },
+      { name: "Sections", value: result.sectionScore ?? 0 },
+      { name: "Formatting", value: result.formattingScore ?? Math.max(0, 100 - (result.formattingRisks || []).length * 10) },
+    ];
 
   return (
     <section className="results">
@@ -727,24 +1163,26 @@ function Results({ result, onDownload, heading = "Your ATS readiness report", ey
           <div className="eyebrow">{eyebrow}</div>
           <h2>{heading}</h2>
         </div>
-        <button className="secondary" onClick={onDownload} type="button"><Download size={16} /> JSON Report</button>
+        <button className="secondary" onClick={onDownload} disabled={downloadLoading} type="button">
+          {downloadLoading ? <><span className="spinner" />Generating PDF...</> : downloadLabel === "JSON Report" ? <><Download size={16} />{downloadLabel}</> : <><FileDown size={16} />{downloadLabel}</>}
+        </button>
       </div>
 
       <div className="result-grid">
         <div className="card score-card">
           <div className="chart-wrap">
             <ResponsiveContainer width="100%" height={245}>
-              <RadialBarChart data={[{ name: "ATS", value: result.overallScore ?? 0, fill: "var(--primary)" }]} innerRadius="68%" outerRadius="100%" startAngle={90} endAngle={-270}>
+              <RadialBarChart data={[{ name: scoreLabel, value: score, fill: "var(--primary)" }]} innerRadius="68%" outerRadius="100%" startAngle={90} endAngle={-270}>
                 <PolarAngleAxis type="number" domain={[0, 100]} tick={false} />
                 <RadialBar dataKey="value" cornerRadius={18} />
               </RadialBarChart>
             </ResponsiveContainer>
             <div className="score-center">
-              <b>{result.overallScore ?? 0}%</b>
-              <span>ATS Score</span>
+              <b>{score}%</b>
+              <span>{scoreLabel}</span>
             </div>
           </div>
-          <ScoreLabel score={result.overallScore ?? 0} />
+          <ScoreLabel score={score} resumeOnly={result.analysisMode === "resume-only"} legacy={!result.analysisMode} />
         </div>
 
         <div className="card result-breakdown-card">
@@ -753,10 +1191,11 @@ function Results({ result, onDownload, heading = "Your ATS readiness report", ey
             {bars.map((item) => (
               <div key={item.name} className="mini-progress">
                 <div className="mini-progress-head">
-                  <span>{item.name}</span>
-                  <strong>{item.value}%</strong>
+                  <span>{item.name}{item.effectiveWeight !== undefined && item.effectiveWeight !== null ? ` · ${item.effectiveWeight}% weight` : ""}</span>
+                  <strong>{item.status === "unavailable" || item.value === null ? "N/A" : `${item.value}%${item.weightedContribution === null || item.weightedContribution === undefined ? "" : ` · ${item.weightedContribution} pts`}`}</strong>
                 </div>
-                <div className="mini-progress-track"><span style={{ width: `${item.value}%` }} /></div>
+                <div className="mini-progress-track"><span style={{ width: `${item.value ?? 0}%` }} /></div>
+                {item.reason && <p className="muted">{item.reason}</p>}
               </div>
             ))}
           </div>
@@ -767,6 +1206,42 @@ function Results({ result, onDownload, heading = "Your ATS readiness report", ey
         <KeywordCard title="Matched Keywords" items={result.matchedKeywords || []} ok />
         <KeywordCard title="Missing Keywords" items={result.missingKeywords || []} />
       </div>
+
+      {result.analysisMode === "resume-only" && (
+        <div className="card section-card">
+          <h3>Resume-only analysis</h3>
+          <p className="muted">No job description was supplied. This report does not include job match, skill gap, or role-specific scoring.</p>
+        </div>
+      )}
+
+      {result.jobRequirements?.skills?.length > 0 && (
+        <div className="card section-card">
+          <h3>Job Skill Evidence</h3>
+          <div className="recommend-list">
+            {result.jobRequirements.skills.map((item) => (
+              <div key={`${item.skill}-${item.requirementType}`}>
+                <strong>{item.skill}</strong> · {item.requirementType} · {item.status}
+                <p className="muted">{item.explanation}</p>
+                {item.evidence?.map((evidence, index) => <p className="muted" key={`${item.skill}-evidence-${index}`}>“{evidence.text}” · {evidence.section}</p>)}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {result.experienceAnalysis?.responsibilities?.length > 0 && (
+        <div className="card section-card">
+          <h3>Responsibility Evidence</h3>
+          <ul className="recommend-list">
+            {result.experienceAnalysis.responsibilities.map((item, index) => (
+              <li key={`responsibility-${index}`}>
+                <strong>{item.status}</strong>: {item.requirement}
+                {item.evidence?.map((evidence, evidenceIndex) => <p className="muted" key={`responsibility-${index}-${evidenceIndex}`}>“{evidence.text}”</p>)}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <div className="card section-card">
         <h3>Resume Sections</h3>
@@ -782,6 +1257,12 @@ function Results({ result, onDownload, heading = "Your ATS readiness report", ey
 
       <div className="card formatting-card">
         <h3>Formatting Risks</h3>
+        {result.atsReadabilityAnalysis && (
+          <p className="muted">
+            Estimated ATS readability: {result.atsReadabilityScore}% · {result.resumeParsingStatus} text extraction · {result.atsReadabilityAnalysis.recognizedSections}/{result.atsReadabilityAnalysis.assessedSections} common sections recognized.
+            {" "}{result.atsReadabilityAnalysis.formula}
+          </p>
+        )}
         {(result.formattingRisks || []).length ? (
           <ul className="recommend-list">
             {result.formattingRisks.map((risk) => <li key={risk}>{risk}</li>)}
@@ -801,18 +1282,96 @@ function Results({ result, onDownload, heading = "Your ATS readiness report", ey
 
         <div className="card recommendation-card">
           <h3>Recommendations</h3>
-          <ul className="recommend-list">
-            {(result.recommendations || []).map((x) => <li key={x}>{x}</li>)}
-          </ul>
+          {result.improvementRecommendations?.length ? (
+            <ul className="recommend-list">
+              {result.improvementRecommendations.map((item, index) => (
+                <li key={`recommendation-${index}`}><strong>{item.priority}: {item.action}</strong> — {item.reason} <span className="muted">Section: {item.section}. {item.changeType}.</span></li>
+              ))}
+            </ul>
+          ) : <ul className="recommend-list">{(result.recommendations || []).map((item) => <li key={item}>{item}</li>)}</ul>}
         </div>
       </div>
+
+      {result.projectAnalysis?.projects?.length > 0 && (
+        <div className="card section-card">
+          <h3>Project Relevance</h3>
+          <ul className="recommend-list">
+            {result.projectAnalysis.projects.map((project, index) => (
+              <li key={`project-${index}`}>
+                <strong>{project.name}</strong> · {project.technologies.join(", ") || "No recognized technologies"}
+                <p className="muted">{project.description}</p>
+                {project.demonstratedSkills.length > 0 && <p className="muted">JD skills evidenced: {project.demonstratedSkills.join(", ")}</p>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {result.educationAnalysis?.requirements?.length > 0 && (
+        <div className="card section-card">
+          <h3>Education and Eligibility</h3>
+          <ul className="recommend-list">
+            {result.educationAnalysis.requirements.map((item) => <li key={item.requirement}>{item.requirement} · {item.requirementType} · {item.status}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {result.eligibilityWarnings?.length > 0 && (
+        <div className="card section-card">
+          <h3>Eligibility Warnings</h3>
+          <ul className="recommend-list">{result.eligibilityWarnings.map((item, index) => <li key={`eligibility-${index}`}>{item.status}: {item.message}</li>)}</ul>
+        </div>
+      )}
+
+      {result.achievementAnalysis?.statements?.length > 0 && (
+        <div className="card section-card">
+          <h3>Achievement Evidence</h3>
+          <ul className="recommend-list">
+            {result.achievementAnalysis.statements.map((item, index) => <li key={`achievement-${index}`}>{item.original}{item.suggestion && <p className="muted">{item.suggestion}</p>}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {result.softSkillsAnalysis?.length > 0 && (
+        <div className="card section-card">
+          <h3>Soft Skills Evidence</h3>
+          <ul className="recommend-list">
+            {result.softSkillsAnalysis.map((item) => <li key={item.skill}>{item.skill}: {item.status}{item.evidence?.map((evidence, index) => <p className="muted" key={`${item.skill}-${index}`}>{evidence}</p>)}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {result.strengths?.length > 0 && (
+        <div className="card section-card">
+          <h3>Strengths</h3>
+          <ul className="recommend-list">{result.strengths.map((item) => <li key={item}>{item}</li>)}</ul>
+        </div>
+      )}
+
+      {result.criticalGaps?.length > 0 && (
+        <div className="card section-card">
+          <h3>Critical Gaps</h3>
+          <ul className="recommend-list">{result.criticalGaps.map((gap) => <li key={gap}>{gap}</li>)}</ul>
+        </div>
+      )}
+
+      {result.limitationsAndUncertainty?.length > 0 && (
+        <div className="card section-card">
+          <h3>Analysis Limitations</h3>
+          <ul className="recommend-list">{result.limitationsAndUncertainty.map((limitation) => <li key={limitation}>{limitation}</li>)}</ul>
+        </div>
+      )}
     </section>
   );
 }
 
-function ScoreLabel({ score }) {
-  const label = score >= 80 ? "Strong Match" : score >= 65 ? "Competitive" : score >= 50 ? "Needs Improvement" : "High Risk";
-  const text = score >= 65 ? "Strong ATS alignment, with room to optimize keywords and presentation." : "Improve keyword and section alignment before applying.";
+function ScoreLabel({ score, resumeOnly, legacy }) {
+  const label = legacy ? "Previously saved score" : resumeOnly ? "Estimated parsing readability" : score >= 80 ? "Strong Match" : score >= 65 ? "Competitive" : score >= 50 ? "Needs Improvement" : "Limited Match";
+  const text = legacy
+    ? "This report predates separate job-match and ATS readability scoring."
+    : resumeOnly
+    ? "This estimates text parsing and section recognition; it is not a job-match score or ATS vendor prediction."
+    : "This evidence-based estimate compares extracted resume evidence with the supplied job description; it does not predict an ATS decision.";
 
   return <div className="score-label"><b>{label}</b><span>{text}</span></div>;
 }
@@ -828,6 +1387,244 @@ function KeywordCard({ title, items, ok }) {
   );
 }
 
+const NOTIFICATION_CATEGORY_LABELS = {
+  job_match: "Job Match",
+  weekly_ats_tips: "Weekly ATS Tips",
+  bullet_point_suggestions: "Bullet Point Suggestions",
+};
+
+function AlertsPage() {
+  const navigate = useNavigate();
+  const [notifications, setNotifications] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [pages, setPages] = useState(0);
+  const [page, setPage] = useState(1);
+  const [readFilter, setReadFilter] = useState("all");
+  const [category, setCategory] = useState("all");
+  const [expandedId, setExpandedId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [busyAction, setBusyAction] = useState("");
+
+  async function loadNotifications() {
+    setLoading(true);
+    setError("");
+    try {
+      const params = new URLSearchParams({ page: String(page), limit: "20" });
+      if (readFilter === "unread") params.set("read", "false");
+      if (readFilter === "read") params.set("read", "true");
+      if (category !== "all") params.set("category", category);
+      const data = await api(`/notifications?${params}`);
+      setNotifications(data.notifications);
+      setUnreadCount(data.unreadCount);
+      setTotal(data.total);
+      setPages(data.pages);
+      if (page > data.pages) setPage(data.pages || 1);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    let active = true;
+    async function refresh() {
+      try {
+        const params = new URLSearchParams({ page: String(page), limit: "20" });
+        if (readFilter === "unread") params.set("read", "false");
+        if (readFilter === "read") params.set("read", "true");
+        if (category !== "all") params.set("category", category);
+        const data = await api(`/notifications?${params}`);
+        if (!active) return;
+        setNotifications(data.notifications);
+        setUnreadCount(data.unreadCount);
+        setTotal(data.total);
+        setPages(data.pages);
+        if (page > data.pages) setPage(data.pages || 1);
+        setError("");
+      } catch (requestError) {
+        if (active) setError(requestError.message);
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+    setLoading(true);
+    refresh();
+    const handleRefresh = () => refresh();
+    window.addEventListener("resumeiq-notifications-updated", handleRefresh);
+    const poll = window.setInterval(handleRefresh, 30000);
+    return () => {
+      active = false;
+      window.clearInterval(poll);
+      window.removeEventListener("resumeiq-notifications-updated", handleRefresh);
+    };
+  }, [page, readFilter, category]);
+
+  function changeReadFilter(value) {
+    setReadFilter(value);
+    setPage(1);
+  }
+
+  function changeCategory(value) {
+    setCategory(value);
+    setPage(1);
+  }
+
+  async function updateRead(notification, makeRead) {
+    const key = `${notification.id}:${makeRead ? "read" : "unread"}`;
+    if (busyAction) return;
+    setBusyAction(key);
+    setActionError("");
+    try {
+      await api(`/notifications/${notification.id}/${makeRead ? "read" : "unread"}`, { method: "PATCH" });
+      await loadNotifications();
+      window.dispatchEvent(new Event("resumeiq-notifications-updated"));
+      return true;
+    } catch (requestError) {
+      setActionError(requestError.message);
+      return false;
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  async function markAllRead() {
+    if (busyAction || unreadCount === 0) return;
+    setBusyAction("read-all");
+    setActionError("");
+    try {
+      await api("/notifications/read-all", { method: "PATCH" });
+      await loadNotifications();
+      window.dispatchEvent(new Event("resumeiq-notifications-updated"));
+    } catch (requestError) {
+      setActionError(requestError.message);
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  async function deleteNotification(notification) {
+    if (busyAction) return;
+    setBusyAction(`${notification.id}:delete`);
+    setActionError("");
+    try {
+      await api(`/notifications/${notification.id}`, { method: "DELETE" });
+      if (expandedId === notification.id) setExpandedId(null);
+      await loadNotifications();
+      window.dispatchEvent(new Event("resumeiq-notifications-updated"));
+    } catch (requestError) {
+      setActionError(requestError.message);
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  async function openNotification(notification) {
+    setExpandedId((current) => current === notification.id ? null : notification.id);
+    if (!notification.isRead) await updateRead(notification, true);
+  }
+
+  async function openAnalysis(notification) {
+    const analysisId = notification.analysisId || notification.actionData?.analysisId;
+    if (!analysisId) return;
+    if (!notification.isRead && !(await updateRead(notification, true))) return;
+    navigate(`/history?id=${encodeURIComponent(analysisId)}`);
+  }
+
+  return (
+    <>
+      <PageTitle
+        eyebrow="YOUR ACCOUNT"
+        title="Notifications"
+        desc="Review analysis alerts and personalized improvement suggestions."
+        action={<button className="secondary" type="button" disabled={Boolean(busyAction) || unreadCount === 0} onClick={markAllRead}><CheckCheck size={16} /> Mark all as read</button>}
+      />
+      {actionError && <div className="error-box" role="alert">{actionError}</div>}
+      <div className="card notifications-shell">
+        <div className="notifications-toolbar">
+          <div className="notifications-unread"><Bell size={18} /><strong>{unreadCount}</strong><span>unread</span></div>
+          <div className="notification-filters" aria-label="Notification read status">
+            {[["all", "All"], ["unread", "Unread"], ["read", "Read"]].map(([value, label]) => (
+              <button key={value} type="button" className={readFilter === value ? "notification-filter active" : "notification-filter"} onClick={() => changeReadFilter(value)}>{label}</button>
+            ))}
+          </div>
+        </div>
+        <div className="notification-category-filters" aria-label="Notification categories">
+          {[
+            ["all", "All categories"],
+            ["job_match", "Job Match"],
+            ["weekly_ats_tips", "Weekly ATS Tips"],
+            ["bullet_point_suggestions", "Bullet Point Suggestions"],
+          ].map(([value, label]) => (
+            <button key={value} type="button" className={category === value ? "notification-category-filter active" : "notification-category-filter"} onClick={() => changeCategory(value)}>{label}</button>
+          ))}
+        </div>
+        {loading ? (
+          <div className="notification-state"><span className="spinner" /> Loading notifications...</div>
+        ) : error ? (
+          <div className="notification-state" role="alert"><p>{error}</p><button className="secondary small" type="button" onClick={loadNotifications}>Retry</button></div>
+        ) : notifications.length === 0 ? (
+          <div className="notification-empty"><Bell size={24} /><strong>No notifications here</strong><span>{total ? "Try a different filter to see more notifications." : "Your analysis alerts and improvement tips will appear here."}</span></div>
+        ) : (
+          <div className="notification-list">
+            {notifications.map((notification) => {
+              const expanded = expandedId === notification.id;
+              const suggestions = Array.isArray(notification.actionData?.suggestions) ? notification.actionData.suggestions : [];
+              const tips = Array.isArray(notification.actionData?.tips) ? notification.actionData.tips : [];
+              return (
+                <article className={`notification-item${notification.isRead ? "" : " unread"}${expanded ? " expanded" : ""}`} key={notification.id}>
+                  <button className="notification-main" type="button" onClick={() => openNotification(notification)} aria-expanded={expanded}>
+                    <span className="notification-status-icon">{notification.isRead ? <Circle size={10} /> : <span aria-label="Unread" />}</span>
+                    <span className="notification-copy">
+                      <span className="notification-item-heading"><strong>{notification.title}</strong><span className={`notification-category ${notification.category}`}>{NOTIFICATION_CATEGORY_LABELS[notification.category] || "Notification"}</span></span>
+                      <span className="notification-message">{notification.message}</span>
+                      <span className="notification-date">{new Date(`${notification.createdAt}Z`).toLocaleString()}</span>
+                    </span>
+                  </button>
+                  {expanded && (
+                    <div className="notification-details">
+                      {notification.actionData?.jobTitle && <p><strong>Target job:</strong> {notification.actionData.jobTitle}</p>}
+                      {tips.length > 0 && <ul>{tips.map((tip, index) => <li key={`${notification.id}-tip-${index}`}>{tip}</li>)}</ul>}
+                      {suggestions.map((suggestion, index) => (
+                        <div className="notification-suggestion" key={`${notification.id}-suggestion-${index}`}>
+                          <strong>Original resume evidence{suggestion.source ? ` · ${suggestion.source}` : ""}</strong><p>{suggestion.original}</p>
+                          <strong>Fact-preserving suggestion</strong><p>{suggestion.suggested}</p>
+                          <strong>Why it is relevant</strong><p>{suggestion.why}</p>
+                        </div>
+                      ))}
+                      {notification.analysisId && <button className="secondary small" type="button" onClick={() => openAnalysis(notification)}><ExternalLink size={14} /> View related analysis</button>}
+                      {!notification.analysisId && <p className="muted">The related analysis is no longer available.</p>}
+                    </div>
+                  )}
+                  <div className="notification-actions">
+                    {notification.isRead
+                      ? <button className="ghost small" type="button" disabled={Boolean(busyAction)} onClick={() => updateRead(notification, false)}>Mark unread</button>
+                      : <button className="ghost small" type="button" disabled={Boolean(busyAction)} onClick={() => updateRead(notification, true)}>Mark read</button>}
+                    <button className="ghost danger small" type="button" disabled={Boolean(busyAction)} onClick={() => deleteNotification(notification)}><Trash2 size={14} /> Delete</button>
+                    {notification.analysisId && <button className="ghost small" type="button" onClick={() => openAnalysis(notification)}>Open analysis</button>}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+        {pages > 1 && (
+          <div className="notification-pagination">
+            <span>Page {page} of {pages}</span>
+            <div>
+              <button className="secondary small" type="button" disabled={page <= 1 || loading} onClick={() => setPage((value) => value - 1)}>Previous</button>
+              <button className="secondary small" type="button" disabled={page >= pages || loading} onClick={() => setPage((value) => value + 1)}>Next</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
 function HistoryPage() {
   const [rows, setRows] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -837,6 +1634,8 @@ function HistoryPage() {
   const [detailError, setDetailError] = useState("");
   const [detailAttempt, setDetailAttempt] = useState(0);
   const [actionError, setActionError] = useState("");
+  const [reportDownloadError, setReportDownloadError] = useState("");
+  const [reportDownloadLoading, setReportDownloadLoading] = useState(false);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [sort, setSort] = useState("newest");
@@ -899,12 +1698,22 @@ function HistoryPage() {
     setSearchParams({ id: String(id) });
   }
 
-  function downloadSelected() {
-    const blob = new Blob([JSON.stringify(selected, null, 2)], { type: "application/json" });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = "resumeiq-analysis.json";
-    link.click();
+  async function downloadSelected() {
+    if (!selectedId || reportDownloadLoading) return;
+    setReportDownloadLoading(true);
+    setReportDownloadError("");
+    try {
+      const report = await api(`/analyses/${encodeURIComponent(selectedId)}`);
+      if (String(report.id) !== String(selectedId)) {
+        throw new Error("The returned report does not match the selected analysis.");
+      }
+      const { downloadAnalysisReport } = await import("./analysis-report-pdf.js");
+      await downloadAnalysisReport(report);
+    } catch (error) {
+      setReportDownloadError(error.message || "Could not generate the PDF report. Try again.");
+    } finally {
+      setReportDownloadLoading(false);
+    }
   }
 
   async function del(id) {
@@ -972,12 +1781,12 @@ function HistoryPage() {
                     <p className="history-label">Job Title</p>
                     <h3>{r.job_title}</h3>
                   </div>
-                  <span className={r.score >= 75 ? "pill success" : r.score >= 55 ? "pill warn" : "pill danger"}>{r.score}%</span>
+                  <span title={r.analysis_mode === "resume-only" ? "ATS readability score" : r.analysis_mode === "job-match" ? "Job match score" : "Legacy score"} aria-label={`${r.analysis_mode === "resume-only" ? "ATS readability" : r.analysis_mode === "job-match" ? "Job match" : "Legacy"} score ${r.score}%`} className={r.score >= 75 ? "pill success" : r.score >= 55 ? "pill warn" : "pill danger"}>{r.score}%</span>
                 </div>
 
                 <div className="history-meta">
 
-                  <div><span>Status</span><strong>{r.score >= 75 ? "Strong" : r.score >= 55 ? "Review" : "Needs work"}</strong></div>
+                  <div><span>{r.analysis_mode === "resume-only" || r.analysis_mode === "legacy" ? "Score type" : "Job match"}</span><strong>{r.analysis_mode === "resume-only" ? "ATS readability" : r.analysis_mode === "legacy" ? "Legacy score" : r.score >= 75 ? "Strong" : r.score >= 55 ? "Review" : "Needs work"}</strong></div>
                    <div><span>Date</span><strong>{new Date(r.created_at + "Z").toLocaleDateString()}</strong></div>
                 </div>
 
@@ -1008,9 +1817,12 @@ function HistoryPage() {
                   <div><span>Resume</span><strong>{selected.resume_name || "Resume"}</strong></div>
                   <div><span>Analyzed</span><strong>{new Date(`${selected.created_at}Z`).toLocaleString()}</strong></div>
                 </div>
+                {reportDownloadError && <div className="error-box" role="alert">{reportDownloadError}</div>}
                 <Results
                   result={selected.result || {}}
                   onDownload={downloadSelected}
+                  downloadLabel="Download Analysis Report"
+                  downloadLoading={reportDownloadLoading}
                   heading={selected.job_title || "Saved analysis"}
                   eyebrow="SAVED ANALYSIS"
                 />
@@ -1115,7 +1927,7 @@ function AdminOverviewPage() {
     ["Resumes uploaded", metrics.totalResumesUploaded],
     ["Active users · 30 days", metrics.activeUsers30Days],
     ["Analyses today", metrics.analysesToday],
-    ["Average ATS score", `${metrics.averageAtsScore}%`],
+    ["Average Job Match", metrics.averageJobMatchScore === null ? "—" : `${metrics.averageJobMatchScore}%`],
     ["New users this month", metrics.newUsersThisMonth],
     ["Analyses per user", metrics.averageAnalysesPerUser],
   ] : [];
@@ -1159,7 +1971,7 @@ function AdminAnalyticsCharts({ overview, compact = false }) {
     <div className="admin-chart-grid">
       <AdminBarChart title="User registrations · 12 months" data={overview.monthlyTrends} xKey="label" dataKey="registrations" color="#0e7490" emptyText="No registrations in this period." />
       <AdminBarChart title="Resume analyses · 12 months" data={overview.monthlyTrends} xKey="label" dataKey="analyses" color="#2563eb" emptyText="No analyses in this period." />
-      <AdminBarChart title="ATS score distribution" data={overview.atsScoreDistribution} xKey="band" dataKey="count" color="#16a34a" emptyText="No valid ATS scores recorded." />
+      <AdminBarChart title="ATS readability distribution" data={overview.atsScoreDistribution} xKey="band" dataKey="count" color="#16a34a" emptyText="No valid ATS readability scores recorded." />
       {!compact && <AdminBarChart title="Popular target job titles" data={titleData} xKey="label" dataKey="count" color="#ea580c" emptyText="No target job titles have been selected." />}
     </div>
   );
@@ -1176,7 +1988,7 @@ function AdminUsagePage() {
 
   return (
     <>
-      <PageTitle eyebrow="USAGE" title="Usage & statistics" desc="Platform activity and ATS score trends based on stored records." />
+      <PageTitle eyebrow="USAGE" title="Usage & statistics" desc="Platform activity, job-match scores, and estimated ATS readability." />
       {loading ? <div className="card admin-loading"><span className="spinner" /> Loading usage statistics...</div> : error ? <div className="error-box" role="alert">{error}</div> : overview && <AdminAnalyticsCharts overview={overview} />}
     </>
   );
@@ -1290,7 +2102,7 @@ function AdminAnalysesPage() {
 
   return (
     <>
-      <PageTitle eyebrow="ANALYSES" title="Resume analyses" desc="Review analysis metadata and ATS scores without exposing resume contents." />
+      <PageTitle eyebrow="ANALYSES" title="Resume analyses" desc="Review analysis metadata and score types without exposing resume contents." />
       <form className="card admin-filters admin-analysis-search" onSubmit={applySearch}>
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search user, email, resume, or role" aria-label="Search resume analyses" />
         <button className="primary" type="submit">Search</button>
@@ -1299,10 +2111,10 @@ function AdminAnalysesPage() {
       <section className="card admin-table-card">
         {loading ? <div className="admin-loading"><span className="spinner" /> Loading analyses...</div> : !result?.analyses.length ? <Empty text="No resume analyses match this search." /> : (
           <div className="admin-table-scroll"><table className="admin-table">
-            <thead><tr><th>Analysis ID</th><th>User</th><th>Resume file</th><th>Target role</th><th>ATS score</th><th>Created</th></tr></thead>
+            <thead><tr><th>Analysis ID</th><th>User</th><th>Resume file</th><th>Target role</th><th>Analysis score</th><th>Created</th></tr></thead>
             <tbody>{result.analyses.map((analysis) => <tr key={analysis.id}>
               <td>{analysis.id}</td><td><strong>{analysis.user_name}</strong><small>{analysis.user_email}</small></td><td>{analysis.resume_name}</td><td>{analysis.job_title}</td>
-              <td><span className={analysis.score >= 75 ? "admin-score high" : analysis.score >= 55 ? "admin-score medium" : "admin-score low"}>{analysis.score}%</span></td><td>{formatAdminDate(analysis.created_at)}</td>
+              <td><span title={analysis.analysis_mode === "resume-only" ? "ATS readability" : analysis.analysis_mode === "job-match" ? "Job match" : "Legacy score"} className={analysis.score >= 75 ? "admin-score high" : analysis.score >= 55 ? "admin-score medium" : "admin-score low"}>{analysis.score}%</span></td><td>{formatAdminDate(analysis.created_at)}</td>
             </tr>)}</tbody>
           </table></div>
         )}
